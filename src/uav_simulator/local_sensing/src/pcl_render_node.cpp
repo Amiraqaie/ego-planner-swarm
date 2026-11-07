@@ -146,7 +146,7 @@ void rcvOdometryCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
 //   geometry_msgs::msg::TransformStamped transformStamped;
 
 //   transformStamped.header.stamp = rclcpp::Clock().now();
-//   transformStamped.header.frame_id = "world";
+//   transformStamped.header.frame_id = "map";
 //   transformStamped.child_frame_id = "camera";
 
 //   transformStamped.transform.translation.x = cam2world(0, 3);

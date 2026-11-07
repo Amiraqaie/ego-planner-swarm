@@ -207,7 +207,7 @@ void cmdCallback()
   time_last = time_now;
 
   cmd.header.stamp = time_now;
-  cmd.header.frame_id = "world";
+  cmd.header.frame_id = "map";
   cmd.trajectory_flag = quadrotor_msgs::msg::PositionCommand::TRAJECTORY_STATUS_READY;
   cmd.trajectory_id = traj_id_;
 
