@@ -660,40 +660,146 @@ namespace ego_planner
     return false;
   }
 
-  bool EGOReplanFSM::planFromCurrentTraj(const int trial_times /*=1*/)
+  // bool EGOReplanFSM::planFromCurrentTraj(const int trial_times /*=1*/)
+  // {
+
+  //   LocalTrajData *info = &planner_manager_->local_data_;
+  //   // ros::Time time_now = ros::Time::now();
+  //   auto time_now = rclcpp::Clock().now();
+  //   // double t_cur = (time_now - info->start_time_).toSec();
+  //   double t_cur = (time_now - info->start_time_).seconds();
+
+  //   start_pt_ = info->position_traj_.evaluateDeBoorT(t_cur);
+  //   start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
+  //   start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
+
+  //   bool success = callReboundReplan(false, false);
+
+  //   if (!success)
+  //   {
+  //     success = callReboundReplan(true, false);
+  //     if (!success)
+  //     {
+  //       for (int i = 0; i < trial_times; i++)
+  //       {
+  //         success = callReboundReplan(true, true);
+  //         if (success)
+  //           break;
+  //       }
+  //       if (!success)
+  //       {
+  //         return false;
+  //       }
+  //     }
+  //   }
+
+  //   return true;
+  // }
+
+  bool EGOReplanFSM::planFromCurrentTraj(
+      const int trial_times)
   {
+      LocalTrajData *info =
+          &planner_manager_->local_data_;
 
-    LocalTrajData *info = &planner_manager_->local_data_;
-    // ros::Time time_now = ros::Time::now();
-    auto time_now = rclcpp::Clock().now();
-    // double t_cur = (time_now - info->start_time_).toSec();
-    double t_cur = (time_now - info->start_time_).seconds();
+      auto time_now = rclcpp::Clock().now();
 
-    start_pt_ = info->position_traj_.evaluateDeBoorT(t_cur);
-    start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
-    start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
+      double t_cur =
+          (time_now - info->start_time_).seconds();
 
-    bool success = callReboundReplan(false, false);
+      // Prevent evaluation outside the trajectory time interval.
+      t_cur = std::clamp(
+          t_cur,
+          0.0,
+          info->duration_);
 
-    if (!success)
-    {
-      success = callReboundReplan(true, false);
+      // Expected position from previous trajectory.
+      Eigen::Vector3d predicted_pos =
+          info->position_traj_.evaluateDeBoorT(t_cur);
+
+      // Actual position from odometry.
+      double deviation =
+          (odom_pos_ - predicted_pos).norm();
+
+      constexpr double DEVIATION_THRESHOLD = 0.5;
+
+      // -------------------------------------------------
+      // CASE 1: Drone is not following the old trajectory
+      // -------------------------------------------------
+
+      if (deviation > DEVIATION_THRESHOLD)
+      {
+          RCLCPP_WARN(
+              node_->get_logger(),
+              "Trajectory deviation: %.3f m. "
+              "Replanning from actual odometry.",
+              deviation);
+
+          // Start from actual drone position.
+          start_pt_ = odom_pos_;
+
+          // Use odometry velocity only if it is valid,
+          // correctly transformed into map, and reliable.
+          start_vel_ = odom_vel_;
+
+          // Conservative initial acceleration.
+          start_acc_.setZero();
+
+          // Force polynomial initialization.
+          // This is essential because otherwise the manager
+          // may still sample the previous B-spline.
+          bool success =
+              callReboundReplan(true, false);
+
+          if (!success)
+          {
+              for (int i = 0; i < trial_times; i++)
+              {
+                  success =
+                      callReboundReplan(true, true);
+
+                  if (success)
+                      break;
+              }
+          }
+
+          return success;
+      }
+
+      // -------------------------------------------------
+      // CASE 2: Drone is following the old trajectory
+      // -------------------------------------------------
+
+      start_pt_ = predicted_pos;
+
+      start_vel_ =
+          info->velocity_traj_.evaluateDeBoorT(t_cur);
+
+      start_acc_ =
+          info->acceleration_traj_.evaluateDeBoorT(t_cur);
+
+      bool success =
+          callReboundReplan(false, false);
+
       if (!success)
       {
-        for (int i = 0; i < trial_times; i++)
-        {
-          success = callReboundReplan(true, true);
-          if (success)
-            break;
-        }
-        if (!success)
-        {
-          return false;
-        }
-      }
-    }
+          success =
+              callReboundReplan(true, false);
 
-    return true;
+          if (!success)
+          {
+              for (int i = 0; i < trial_times; i++)
+              {
+                  success =
+                      callReboundReplan(true, true);
+
+                  if (success)
+                      break;
+              }
+          }
+      }
+
+      return success;
   }
 
   void EGOReplanFSM::checkCollisionCallback()
