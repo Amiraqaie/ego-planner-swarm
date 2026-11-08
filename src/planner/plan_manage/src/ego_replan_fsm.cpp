@@ -22,6 +22,8 @@ namespace ego_planner
     node_->declare_parameter("fsm/emergency_time", 1.0);
     node_->declare_parameter("fsm/realworld_experiment", false);
     node_->declare_parameter("fsm/fail_safe", true);
+    node_->declare_parameter("fsm/default_goal_height", 1.0);
+    node_->get_parameter("fsm/default_goal_height", default_goal_height_);
 
     node_->get_parameter("fsm/flight_type", target_type_);
     node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
@@ -241,7 +243,13 @@ namespace ego_planner
 
     init_pt_ = odom_pos_;
 
-    Eigen::Vector3d end_wp(msg->pose.position.x, msg->pose.position.y, 1.0);
+    // Use the commanded z if it is meaningful; RViz 2D goals send z = 0,
+    // so fall back to the default height in that case.
+    double goal_z = (msg->pose.position.z > 0.05)
+                        ? msg->pose.position.z
+                        : default_goal_height_;
+
+    Eigen::Vector3d end_wp(msg->pose.position.x, msg->pose.position.y, goal_z);
 
     planNextWaypoint(end_wp);
   }
