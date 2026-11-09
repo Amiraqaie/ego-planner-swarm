@@ -24,7 +24,12 @@ namespace ego_planner
     node_->declare_parameter("fsm/fail_safe", true);
     node_->declare_parameter("fsm/default_goal_height", 1.0);
     node_->get_parameter("fsm/default_goal_height", default_goal_height_);
+    node_->declare_parameter("fsm/goal_topic", std::string("/move_base_simple/goal"));
+    node_->declare_parameter("fsm/goal_z_valid_min", 0.1);
 
+    std::string goal_topic;
+    node_->get_parameter("fsm/goal_topic", goal_topic);
+    node_->get_parameter("fsm/goal_z_valid_min", goal_z_valid_min_);
     node_->get_parameter("fsm/flight_type", target_type_);
     node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
     node_->get_parameter("fsm/thresh_no_replan_meter", no_replan_thresh_);
@@ -101,7 +106,7 @@ namespace ego_planner
     }
     
     swarm_trajs_pub_ = node_->create_publisher<traj_utils::msg::MultiBsplines>(pub_topic_name, 10);
-
+    new_goal_pub_ = node_->create_publisher<std_msgs::msg::Int32>("/ego/new_goal", 10);
     broadcast_bspline_pub_ = node_->create_publisher<traj_utils::msg::Bspline>("planning/broadcast_bspline_from_planner", 10);
     broadcast_bspline_sub_ = node_->create_subscription<traj_utils::msg::Bspline>(
         "planning/broadcast_bspline_to_planner",
@@ -117,7 +122,7 @@ namespace ego_planner
     if (target_type_ == TARGET_TYPE::MANUAL_TARGET)
     {
       waypoint_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
-          "/move_base_simple/goal",
+          goal_topic,        // was "/move_base_simple/goal"
           1,
           [this](const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
           {
@@ -185,10 +190,11 @@ namespace ego_planner
     planNextWaypoint(wps_[wp_id_]);
   }
 
-  void EGOReplanFSM::planNextWaypoint(const Eigen::Vector3d next_wp)
+  void EGOReplanFSM::planNextWaypoint(const Eigen::Vector3d next_wp, bool restart)
   {
-    bool success = false;
-    success = planner_manager_->planGlobalTraj(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), next_wp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    bool success = planner_manager_->planGlobalTraj(
+        odom_pos_, odom_vel_, Eigen::Vector3d::Zero(),
+        next_wp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
     if (success)
     {
@@ -204,11 +210,30 @@ namespace ego_planner
 
       end_vel_.setZero();
       have_target_ = true;
-      have_new_target_ = true;
+      have_new_target_ = true;   // forces polynomial init in reboundReplan
 
-      /*** FSM状态转换 ***/
-      if (exec_state_ == WAIT_TARGET)
+      if (restart)
+      {
+        // 1. Forget the running local trajectory. A zero start_time_ makes
+        //    checkCollisionCallback() return early, so nothing replans the old one.
+        //    RCL_SYSTEM_TIME matches the clock used elsewhere in the FSM.
+        planner_manager_->local_data_.start_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
+        flag_escape_emergency_ = true;
+
+        // 2. Tell traj_server to drop the old trajectory. The payload is the last
+        //    traj_id, so traj_server can ignore any older B-spline still in flight.
+        //    Only sent after global planning succeeded.
+        std_msgs::msg::Int32 ng;
+        ng.data = planner_manager_->local_data_.traj_id_;
+        new_goal_pub_->publish(ng);
+
+        // 3. GEN_NEW_TRAJ plans from odom_pos_/odom_vel_, not from the old B-spline.
+        changeFSMExecState(GEN_NEW_TRAJ, "NEW_GOAL");
+      }
+      else if (exec_state_ == WAIT_TARGET)
+      {
         changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
+      }
       else
       {
         while (exec_state_ != EXEC_TRAJ)
@@ -226,7 +251,7 @@ namespace ego_planner
       RCLCPP_ERROR(node_->get_logger(), "Unable to generate global trajectory!");
     }
   }
-
+  
   void EGOReplanFSM::triggerCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
   {
     have_trigger_ = true;
@@ -236,22 +261,46 @@ namespace ego_planner
 
   void EGOReplanFSM::waypointCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
   {
-    if (msg->pose.position.z < -0.1)
+    if (!have_odom_)
+    {
+      RCLCPP_WARN(node_->get_logger(), "Goal ignored: no odometry yet.");
       return;
+    }
 
-    cout << "Triggered!" << endl;
+    const double gx = msg->pose.position.x;
+    const double gy = msg->pose.position.y;
+    const double gz = msg->pose.position.z;
+
+    if (!std::isfinite(gx) || !std::isfinite(gy) || !std::isfinite(gz))
+    {
+      RCLCPP_WARN(node_->get_logger(), "Goal ignored: non-finite position.");
+      return;
+    }
+
+    if (!msg->header.frame_id.empty() && msg->header.frame_id != "map")
+      RCLCPP_WARN(node_->get_logger(),
+                  "Goal frame is '%s', planner works in 'map'. Position is used as-is.",
+                  msg->header.frame_id.c_str());
+
+    // z rule: RViz 2D goal gives z = 0 -> keep the current UAV height.
+    const bool z_given = gz > goal_z_valid_min_;
+    const double goal_z = z_given ? gz : odom_pos_(2);
+
+    Eigen::Vector3d end_wp(gx, gy, goal_z);
+
+    // reboundReplan() rejects start/target closer than 0.2 m and would retry forever.
+    if ((end_wp - odom_pos_).norm() < 0.25)
+    {
+      RCLCPP_WARN(node_->get_logger(), "Goal ignored: closer than 0.25 m to the UAV.");
+      return;
+    }
+
+    RCLCPP_INFO(node_->get_logger(),
+                "New goal (%.2f, %.2f, %.2f) [z %s]", gx, gy, goal_z,
+                z_given ? "from goal" : "= current UAV height");
 
     init_pt_ = odom_pos_;
-
-    // Use the commanded z if it is meaningful; RViz 2D goals send z = 0,
-    // so fall back to the default height in that case.
-    double goal_z = (msg->pose.position.z > 0.05)
-                        ? msg->pose.position.z
-                        : default_goal_height_;
-
-    Eigen::Vector3d end_wp(msg->pose.position.x, msg->pose.position.y, goal_z);
-
-    planNextWaypoint(end_wp);
+    planNextWaypoint(end_wp, true);   // true = hard restart
   }
 
   void EGOReplanFSM::odometryCallback(const std::shared_ptr<const nav_msgs::msg::Odometry> &msg)

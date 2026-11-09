@@ -23,7 +23,7 @@ find_package(path_searching REQUIRED)
 find_package(bspline_opt REQUIRED)
 find_package(traj_utils REQUIRED COMPONENTS traj_utils_lib)
 find_package(cv_bridge REQUIRED)
-
+find_package(std_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(pcl_conversions REQUIRED)
@@ -58,6 +58,7 @@ add_executable(ego_planner_node
 # )
 
 ament_target_dependencies(ego_planner_node 
+                          std_msgs
                           rclcpp nav_msgs visualization_msgs 
                           geometry_msgs quadrotor_msgs 
                           plan_env path_searching 
@@ -73,6 +74,7 @@ target_link_libraries(ego_planner_node
 add_executable(traj_server src/traj_server.cpp)
 
 ament_target_dependencies(traj_server 
+                          std_msgs
                           rclcpp nav_msgs 
                           visualization_msgs geometry_msgs 
                           quadrotor_msgs plan_env 

@@ -20,6 +20,7 @@
 #include "traj_utils/msg/data_disp.hpp"
 #include "ego_planner/planner_manager.h"
 #include "traj_utils/planning_visualization.h"
+#include <std_msgs/msg/int32.hpp>
 
 using std::vector;
 
@@ -110,7 +111,7 @@ namespace ego_planner
     void printFSMExecState();
 
     void readGivenWps();
-    void planNextWaypoint(const Eigen::Vector3d next_wp);
+    void planNextWaypoint(const Eigen::Vector3d next_wp, bool restart = false);
     void getLocalTarget();
 
     /* ROS functions */
@@ -124,6 +125,8 @@ namespace ego_planner
 
     bool checkCollision();
     void publishSwarmTrajs(bool startup_pub);
+    double goal_z_valid_min_;
+    rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr new_goal_pub_;
 
   public:
     EGOReplanFSM(/* args */)

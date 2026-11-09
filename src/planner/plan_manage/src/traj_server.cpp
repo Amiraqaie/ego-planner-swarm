@@ -5,7 +5,12 @@
 #include "std_msgs/msg/empty.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 #include <rclcpp/rclcpp.hpp>
+#include "std_msgs/msg/int32.hpp"
 
+rclcpp::Time time_last_(0, 0, RCL_ROS_TIME);   // replaces the static in cmdCallback
+double odom_yaw_ = 0.0;
+bool reset_on_next_traj_ = true;               // true so the first trajectory also starts clean
+int min_valid_traj_id_ = -1;
 rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub;
 
 quadrotor_msgs::msg::PositionCommand cmd;
@@ -24,8 +29,26 @@ int traj_id_;
 double last_yaw_, last_yaw_dot_;
 double time_forward_;
 
+void odomCallback(nav_msgs::msg::Odometry::ConstSharedPtr msg)
+{
+  const auto &q = msg->pose.pose.orientation;
+  odom_yaw_ = atan2(2.0 * (q.w * q.z + q.x * q.y),
+                    1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+}
+
+void newGoalCallback(std_msgs::msg::Int32::ConstSharedPtr msg)
+{
+  receive_traj_ = false;                    // stop publishing the old trajectory now
+  reset_on_next_traj_ = true;               // reset yaw state on the next accepted spline
+  min_valid_traj_id_ = msg->data + 1;       // ignore anything planned before this goal
+}
+
 void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 {
+
+  if (msg->traj_id < min_valid_traj_id_)
+    return;   // stale B-spline from the previous goal
+
   // parse pos traj
 
   Eigen::MatrixXd pos_pts(3, msg->pos_pts.size());
@@ -64,6 +87,15 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
   traj_.push_back(traj_[1].getDerivative());
 
   traj_duration_ = traj_[0].getTimeSum();
+
+  if (reset_on_next_traj_)
+  {
+    last_yaw_ = odom_yaw_;      // start from the actual heading
+    last_yaw_dot_ = 0.0;
+    time_last_ = rclcpp::Clock(RCL_ROS_TIME).now();
+    reset_on_next_traj_ = false;
+    min_valid_traj_id_ = -1;
+  }
 
   receive_traj_ = true;
 }
@@ -174,7 +206,7 @@ void cmdCallback()
   Eigen::Vector3d pos(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero()), pos_f;
   std::pair<double, double> yaw_yawdot(0, 0);
 
-  static rclcpp::Time time_last = clock.now();
+  // static rclcpp::Time time_last = clock.now();
   if (t_cur < traj_duration_ && t_cur >= 0.0)
   {
     pos = traj_[0].evaluateDeBoorT(t_cur);
@@ -182,7 +214,7 @@ void cmdCallback()
     acc = traj_[2].evaluateDeBoorT(t_cur);
 
     /*** calculate yaw ***/
-    yaw_yawdot = calculate_yaw(t_cur, pos, time_now, time_last);
+    yaw_yawdot = calculate_yaw(t_cur, pos, time_now, time_last_);
     /*** calculate yaw ***/
 
     double tf = min(traj_duration_, t_cur + 2.0);
@@ -204,7 +236,7 @@ void cmdCallback()
   {
     cout << "[Traj server]: invalid time." << endl;
   }
-  time_last = time_now;
+  time_last_ = time_now;
 
   cmd.header.stamp = time_now;
   cmd.header.frame_id = "map";
@@ -240,7 +272,10 @@ int main(int argc, char **argv)
       "planning/bspline",
       10,
       bsplineCallback);
-
+  auto odom_sub = node->create_subscription<nav_msgs::msg::Odometry>(
+      "odom_world", 10, odomCallback);
+  auto goal_sub = node->create_subscription<std_msgs::msg::Int32>(
+      "/ego/new_goal", 10, newGoalCallback);
   pos_cmd_pub = node->create_publisher<quadrotor_msgs::msg::PositionCommand>(
       "/position_cmd",
       50);
