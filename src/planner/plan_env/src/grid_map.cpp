@@ -881,40 +881,6 @@ void GridMap::freeCloudCallback(const sensor_msgs::msg::PointCloud2::ConstShared
   }
 }
 
-void GridMap::freeCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
-{
-  if (!mp_.use_free_space_only_)
-    return;
-
-  pcl::PointCloud<pcl::PointXYZ> cloud;
-  pcl::fromROSMsg(*msg, cloud);
-
-  Eigen::Vector3i id;
-  for (const auto &p : cloud.points)
-  {
-    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
-      continue;
-    Eigen::Vector3d pos(p.x, p.y, p.z);
-    if (!isInMap(pos))
-      continue;
-    posToIndex(pos, id);
-
-    // widen far points to close the gaps between diverging rays
-    const double dist = md_.has_odom_ ? (pos - md_.camera_pos_).norm() : 0.0;
-    const int h = std::min(
-        mp_.free_dilate_max_,
-        static_cast<int>(0.5 * dist * mp_.free_dilate_angle_ * mp_.resolution_inv_));
-    for (int dx = -h; dx <= h; ++dx)
-      for (int dy = -h; dy <= h; ++dy)
-        for (int dz = -h; dz <= h; ++dz)
-        {
-          Eigen::Vector3i n(id(0) + dx, id(1) + dy, id(2) + dz);
-          if (!isInMap(n))
-            continue;
-          md_.free_buffer_[toAddress(n)] = 1;
-        }
-  }
-
   // lidar min range leaves unknown voxels around the body: force them free
   if (md_.has_odom_ && mp_.free_around_odom_ > 0.0)
   {
