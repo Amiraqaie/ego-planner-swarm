@@ -881,23 +881,6 @@ void GridMap::freeCloudCallback(const sensor_msgs::msg::PointCloud2::ConstShared
   }
 }
 
-  // lidar min range leaves unknown voxels around the body: force them free
-  if (md_.has_odom_ && mp_.free_around_odom_ > 0.0)
-  {
-    Eigen::Vector3d lo = md_.camera_pos_ - Eigen::Vector3d::Constant(mp_.free_around_odom_);
-    Eigen::Vector3d hi = md_.camera_pos_ + Eigen::Vector3d::Constant(mp_.free_around_odom_);
-    Eigen::Vector3i lo_id, hi_id;
-    posToIndex(lo, lo_id);
-    posToIndex(hi, hi_id);
-    boundIndex(lo_id);
-    boundIndex(hi_id);
-    for (int x = lo_id(0); x <= hi_id(0); ++x)
-      for (int y = lo_id(1); y <= hi_id(1); ++y)
-        for (int z = lo_id(2); z <= hi_id(2); ++z)
-          md_.free_buffer_[toAddress(x, y, z)] = 1;
-  }
-}
-
 void GridMap::trimFreeBuffer()
 {
   if (!mp_.use_free_space_only_ || mp_.free_keep_range_ <= 0.0 || !md_.has_odom_)
