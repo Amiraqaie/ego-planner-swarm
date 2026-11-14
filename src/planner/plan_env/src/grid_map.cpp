@@ -45,6 +45,13 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/local_map_margin", 1);
   node_->declare_parameter("grid_map/ground_height", 1.0);
   node_->declare_parameter("grid_map/odom_depth_timeout", 1.0);
+  node_->declare_parameter("grid_map/use_free_space_only", false);
+  node_->declare_parameter("grid_map/free_around_odom", 0.5);
+  node_->declare_parameter("grid_map/free_dilate_angle", 0.01);
+  node_->declare_parameter("grid_map/free_dilate_max", 2);
+  node_->declare_parameter("grid_map/free_keep_range", 15.0);
+  node_->declare_parameter("grid_map/free_publish_range", 6.0);
+  node_->declare_parameter("grid_map/free_publish_stride", 1);
 
   node_->get_parameter("grid_map/resolution", mp_.resolution_);
   node_->get_parameter("grid_map/map_size_x", x_size);
@@ -82,6 +89,14 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/local_map_margin", mp_.local_map_margin_);
   node_->get_parameter("grid_map/ground_height", mp_.ground_height_);
   node_->get_parameter("grid_map/odom_depth_timeout", mp_.odom_depth_timeout_);
+  node_->get_parameter("grid_map/use_free_space_only", mp_.use_free_space_only_);
+  node_->get_parameter("grid_map/free_around_odom", mp_.free_around_odom_);
+  node_->get_parameter("grid_map/free_dilate_angle", mp_.free_dilate_angle_);
+  node_->get_parameter("grid_map/free_dilate_max", mp_.free_dilate_max_);
+  node_->get_parameter("grid_map/free_keep_range", mp_.free_keep_range_);
+  node_->get_parameter("grid_map/free_publish_range", mp_.free_publish_range_);
+  node_->get_parameter("grid_map/free_publish_stride", mp_.free_publish_stride_);
+  mp_.free_publish_stride_ = std::max(1, mp_.free_publish_stride_);
 
   if (mp_.virtual_ceil_height_ - mp_.ground_height_ > z_size)
   {
@@ -122,6 +137,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   md_.count_hit_ = vector<short>(buffer_size, 0);
   md_.flag_rayend_ = vector<char>(buffer_size, -1);
   md_.flag_traverse_ = vector<char>(buffer_size, -1);
+  md_.free_buffer_ = vector<char>(buffer_size, 0);
 
   md_.raycast_num_ = 0;
 
@@ -170,6 +186,17 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
 
   indep_odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
       "grid_map/odom", 10, std::bind(&GridMap::odomCallback, this, std::placeholders::_1));
+
+  free_cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+      "grid_map/free_cloud", rclcpp::QoS(5),
+      std::bind(&GridMap::freeCloudCallback, this, std::placeholders::_1));
+
+  free_trim_timer_ = node_->create_wall_timer(
+      std::chrono::seconds(1), std::bind(&GridMap::trimFreeBuffer, this));
+  free_space_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+      "grid_map/free_space", 10);
+  free_pub_timer_ = node_->create_wall_timer(
+      std::chrono::milliseconds(200), std::bind(&GridMap::publishFreeSpace, this));
 
   // 定时器
   occ_timer_ = node_->create_wall_timer(
@@ -803,6 +830,146 @@ void GridMap::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
   md_.has_odom_ = true;
 }
 
+void GridMap::freeCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
+{
+  if (!mp_.use_free_space_only_)
+    return;
+
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  pcl::fromROSMsg(*msg, cloud);
+
+  Eigen::Vector3i id;
+  for (const auto &p : cloud.points)
+  {
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+      continue;
+    Eigen::Vector3d pos(p.x, p.y, p.z);
+    if (!isInMap(pos))
+      continue;
+    posToIndex(pos, id);
+
+    // widen far points to close the gaps between diverging rays
+    const double dist = md_.has_odom_ ? (pos - md_.camera_pos_).norm() : 0.0;
+    const int h = std::min(
+        mp_.free_dilate_max_,
+        static_cast<int>(0.5 * dist * mp_.free_dilate_angle_ * mp_.resolution_inv_));
+    for (int dx = -h; dx <= h; ++dx)
+      for (int dy = -h; dy <= h; ++dy)
+        for (int dz = -h; dz <= h; ++dz)
+        {
+          Eigen::Vector3i n(id(0) + dx, id(1) + dy, id(2) + dz);
+          if (!isInMap(n))
+            continue;
+          md_.free_buffer_[toAddress(n)] = 1;
+        }
+  }
+
+  // lidar min range leaves unknown voxels around the body: force them free
+  if (md_.has_odom_ && mp_.free_around_odom_ > 0.0)
+  {
+    Eigen::Vector3d lo = md_.camera_pos_ - Eigen::Vector3d::Constant(mp_.free_around_odom_);
+    Eigen::Vector3d hi = md_.camera_pos_ + Eigen::Vector3d::Constant(mp_.free_around_odom_);
+    Eigen::Vector3i lo_id, hi_id;
+    posToIndex(lo, lo_id);
+    posToIndex(hi, hi_id);
+    boundIndex(lo_id);
+    boundIndex(hi_id);
+    for (int x = lo_id(0); x <= hi_id(0); ++x)
+      for (int y = lo_id(1); y <= hi_id(1); ++y)
+        for (int z = lo_id(2); z <= hi_id(2); ++z)
+          md_.free_buffer_[toAddress(x, y, z)] = 1;
+  }
+}
+
+void GridMap::freeCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
+{
+  if (!mp_.use_free_space_only_)
+    return;
+
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  pcl::fromROSMsg(*msg, cloud);
+
+  Eigen::Vector3i id;
+  for (const auto &p : cloud.points)
+  {
+    if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+      continue;
+    Eigen::Vector3d pos(p.x, p.y, p.z);
+    if (!isInMap(pos))
+      continue;
+    posToIndex(pos, id);
+
+    // widen far points to close the gaps between diverging rays
+    const double dist = md_.has_odom_ ? (pos - md_.camera_pos_).norm() : 0.0;
+    const int h = std::min(
+        mp_.free_dilate_max_,
+        static_cast<int>(0.5 * dist * mp_.free_dilate_angle_ * mp_.resolution_inv_));
+    for (int dx = -h; dx <= h; ++dx)
+      for (int dy = -h; dy <= h; ++dy)
+        for (int dz = -h; dz <= h; ++dz)
+        {
+          Eigen::Vector3i n(id(0) + dx, id(1) + dy, id(2) + dz);
+          if (!isInMap(n))
+            continue;
+          md_.free_buffer_[toAddress(n)] = 1;
+        }
+  }
+
+  // lidar min range leaves unknown voxels around the body: force them free
+  if (md_.has_odom_ && mp_.free_around_odom_ > 0.0)
+  {
+    Eigen::Vector3d lo = md_.camera_pos_ - Eigen::Vector3d::Constant(mp_.free_around_odom_);
+    Eigen::Vector3d hi = md_.camera_pos_ + Eigen::Vector3d::Constant(mp_.free_around_odom_);
+    Eigen::Vector3i lo_id, hi_id;
+    posToIndex(lo, lo_id);
+    posToIndex(hi, hi_id);
+    boundIndex(lo_id);
+    boundIndex(hi_id);
+    for (int x = lo_id(0); x <= hi_id(0); ++x)
+      for (int y = lo_id(1); y <= hi_id(1); ++y)
+        for (int z = lo_id(2); z <= hi_id(2); ++z)
+          md_.free_buffer_[toAddress(x, y, z)] = 1;
+  }
+}
+
+void GridMap::trimFreeBuffer()
+{
+  if (!mp_.use_free_space_only_ || mp_.free_keep_range_ <= 0.0 || !md_.has_odom_)
+    return;
+
+  const Eigen::Vector3d r = Eigen::Vector3d::Constant(mp_.free_keep_range_);
+  Eigen::Vector3i lo, hi;
+  posToIndex(md_.camera_pos_ - r, lo);
+  posToIndex(md_.camera_pos_ + r, hi);
+  boundIndex(lo);
+  boundIndex(hi);
+
+  const int nx = mp_.map_voxel_num_(0);
+  const int ny = mp_.map_voxel_num_(1);
+  const int nz = mp_.map_voxel_num_(2);
+
+  for (int x = 0; x < nx; ++x)
+  {
+    char *xs = md_.free_buffer_.data() + static_cast<size_t>(x) * ny * nz;
+    if (x < lo(0) || x > hi(0))
+    {
+      std::fill(xs, xs + static_cast<size_t>(ny) * nz, 0);
+      continue;
+    }
+    for (int y = 0; y < ny; ++y)
+    {
+      char *ys = xs + static_cast<size_t>(y) * nz;
+      if (y < lo(1) || y > hi(1))
+      {
+        std::fill(ys, ys + nz, 0);
+        continue;
+      }
+      std::fill(ys, ys + lo(2), 0);
+      std::fill(ys + hi(2) + 1, ys + nz, 0);
+    }
+  }
+}
+
 void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
 {
 
@@ -1011,6 +1178,46 @@ void GridMap::publishMapInflate(bool all_info)
   map_inf_pub_->publish(cloud_msg);
 
   // RCLCPP_INFO(rclcpp::get_logger("publishMapInflate"), "pub map");
+}
+
+void GridMap::publishFreeSpace()
+{
+  if (free_space_pub_->get_subscription_count() <= 0 || !md_.has_odom_)
+    return;
+
+  const Eigen::Vector3d r = Eigen::Vector3d::Constant(mp_.free_publish_range_);
+  Eigen::Vector3i lo, hi;
+  posToIndex(md_.camera_pos_ - r, lo);
+  posToIndex(md_.camera_pos_ + r, hi);
+  boundIndex(lo);
+  boundIndex(hi);
+
+  const int stride = mp_.free_publish_stride_;
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  Eigen::Vector3d pos;
+
+  for (int x = lo(0); x <= hi(0); x += stride)
+    for (int y = lo(1); y <= hi(1); y += stride)
+      for (int z = lo(2); z <= hi(2); z += stride)
+      {
+        Eigen::Vector3i id(x, y, z);
+        // known free AND not inside an inflated obstacle
+        if (!isKnownFree(id))
+          continue;
+        indexToPos(id, pos);
+        cloud.push_back(pcl::PointXYZ(
+            static_cast<float>(pos(0)), static_cast<float>(pos(1)), static_cast<float>(pos(2))));
+      }
+
+  cloud.width = cloud.points.size();
+  cloud.height = 1;
+  cloud.is_dense = true;
+  cloud.header.frame_id = mp_.frame_id_;
+
+  sensor_msgs::msg::PointCloud2 msg;
+  pcl::toROSMsg(cloud, msg);
+  msg.header.stamp = node_->now();
+  free_space_pub_->publish(msg);
 }
 
 bool GridMap::odomValid() { return md_.has_odom_; }

@@ -6,6 +6,7 @@
 #include <cv_bridge/cv_bridge.h>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <iostream>
+#include <algorithm>
 #include <random>
 #include <nav_msgs/msg/odometry.hpp>
 #include <queue>
@@ -87,6 +88,15 @@ struct MappingParameters
 
   /* active mapping */
   double unknown_flag_;
+
+  /* free-space-only planning */
+  bool use_free_space_only_;
+  double free_around_odom_;
+  double free_dilate_angle_;   // rad, ~ angular spacing between rays
+  int free_dilate_max_;        // cap in voxels
+  double free_keep_range_;     // m, <=0: never forget
+  double free_publish_range_;   // m, half-size of the box around the drone that is published
+  int free_publish_stride_;     // 1 = every voxel, 2 = every 2nd voxel per axis, ...
 };
 
 // intermediate mapping data for fusion
@@ -97,6 +107,8 @@ struct MappingData
 
   std::vector<double> occupancy_buffer_;
   std::vector<char> occupancy_buffer_inflate_;
+
+  std::vector<char> free_buffer_;   // 1 = seen as free by octomap, 0 = unknown
 
   // camera position and pose data
 
@@ -211,6 +223,10 @@ private:
   void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img);
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom);
 
+  void freeCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  void trimFreeBuffer();
+  void publishFreeSpace();
+
   // update occupancy by raycasting
   void updateOccupancyCallback();
   void visCallback();
@@ -245,6 +261,11 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr indep_cloud_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr indep_odom_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr extrinsic_sub_;
+
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr free_cloud_sub_;
+  rclcpp::TimerBase::SharedPtr free_trim_timer_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr free_space_pub_;
+  rclcpp::TimerBase::SharedPtr free_pub_timer_;
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_inf_pub_;
@@ -300,8 +321,9 @@ inline bool GridMap::isKnownFree(const Eigen::Vector3i &id)
   boundIndex(id1);
   int adr = toAddress(id1);
 
-  // return md_.occupancy_buffer_[adr] >= mp_.clamp_min_log_ &&
-  //     md_.occupancy_buffer_[adr] < mp_.min_occupancy_log_;
+  if (mp_.use_free_space_only_)
+    return md_.free_buffer_[adr] == 1 && md_.occupancy_buffer_inflate_[adr] == 0;
+
   return md_.occupancy_buffer_[adr] >= mp_.clamp_min_log_ && md_.occupancy_buffer_inflate_[adr] == 0;
 }
 
@@ -311,7 +333,10 @@ inline bool GridMap::isKnownOccupied(const Eigen::Vector3i &id)
   boundIndex(id1);
   int adr = toAddress(id1);
 
-  return md_.occupancy_buffer_inflate_[adr] == 1;
+  if (md_.occupancy_buffer_inflate_[adr] == 1)
+    return true;
+  // unknown counts as blocked
+  return mp_.use_free_space_only_ && md_.free_buffer_[adr] == 0;
 }
 
 inline void GridMap::setOccupied(Eigen::Vector3d pos)
@@ -361,8 +386,13 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos)
 
   Eigen::Vector3i id;
   posToIndex(pos, id);
+  int adr = toAddress(id);
 
-  return int(md_.occupancy_buffer_inflate_[toAddress(id)]);
+  if (md_.occupancy_buffer_inflate_[adr])
+    return 1;
+  if (mp_.use_free_space_only_ && md_.free_buffer_[adr] == 0)
+    return 1;   // unknown = blocked
+  return 0;
 }
 
 inline int GridMap::getOccupancy(Eigen::Vector3i id)

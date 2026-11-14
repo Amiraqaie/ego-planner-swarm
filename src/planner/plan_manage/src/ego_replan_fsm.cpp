@@ -1032,6 +1032,29 @@ namespace ego_planner
     {
       local_target_vel_ = planner_manager_->global_data_.getVelocity(t);
     }
+
+    // free-space-only: pull the local target back to known free space
+    auto map = planner_manager_->grid_map_;
+    if (map->getInflateOccupancy(local_target_pt_) != 0)
+    {
+      Eigen::Vector3d dir = start_pt_ - local_target_pt_;
+      const double len = dir.norm();
+      if (len > 1e-3)
+      {
+        dir /= len;
+        const double res = map->getResolution();
+        for (double d = res; d < len; d += res)
+        {
+          Eigen::Vector3d p = local_target_pt_ + dir * d;
+          if (map->getInflateOccupancy(p) == 0)
+          {
+            local_target_pt_ = p;
+            local_target_vel_.setZero();   // stop at the frontier
+            break;
+          }
+        }
+      }
+    }
   }
 
 } // namespace ego_planner
