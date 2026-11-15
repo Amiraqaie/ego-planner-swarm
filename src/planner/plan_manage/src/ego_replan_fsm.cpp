@@ -26,8 +26,10 @@ namespace ego_planner
     node_->get_parameter("fsm/default_goal_height", default_goal_height_);
     node_->declare_parameter("fsm/goal_topic", std::string("/move_base_simple/goal"));
     node_->declare_parameter("fsm/goal_z_valid_min", 0.1);
-
+    node_->declare_parameter("fsm/use_astar_global", false);
     std::string goal_topic;
+
+    node_->get_parameter("fsm/use_astar_global", use_astar_global_);
     node_->get_parameter("fsm/goal_topic", goal_topic);
     node_->get_parameter("fsm/goal_z_valid_min", goal_z_valid_min_);
     node_->get_parameter("fsm/flight_type", target_type_);
@@ -595,7 +597,16 @@ namespace ego_planner
       }
       else
       {
-        changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        if (continously_called_times_ > 200)
+        {
+          RCLCPP_ERROR(node_->get_logger(), "Planning keeps failing, dropping the goal. Send a new goal.");
+          have_target_ = false;
+          changeFSMExecState(WAIT_TARGET, "GIVEUP");
+        }
+        else
+        {
+          changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        }
       }
       break;
     }
@@ -610,18 +621,35 @@ namespace ego_planner
       }
       else
       {
-        if (planner_manager_->grid_map_->useFreeSpaceOnly() && continously_called_times_ % 5 == 0)
-          planGlobalRoute(end_pt_);   // repeated failure: the global route itself may be bad
-        changeFSMExecState(REPLAN_TRAJ, "FSM");
-      }
+        static rclcpp::Time last_route_time(0, 0, RCL_SYSTEM_TIME);
+        const rclcpp::Time now_t = rclcpp::Clock().now();
+        if (use_astar_global_ &&
+            planner_manager_->grid_map_->useFreeSpaceOnly() &&
+            continously_called_times_ % 5 == 0 &&
+            (now_t - last_route_time).seconds() > 1.0)
+        {
+          last_route_time = now_t;
+          planGlobalRoute(end_pt_);
+        }
 
+        if (continously_called_times_ > 200)   // give up instead of retrying forever
+        {
+          RCLCPP_ERROR(node_->get_logger(), "Replan keeps failing, dropping the goal. Send a new goal.");
+          have_target_ = false;
+          changeFSMExecState(WAIT_TARGET, "GIVEUP");
+        }
+        else
+        {
+          changeFSMExecState(REPLAN_TRAJ, "FSM");
+        }
+      }
       break;
     }
 
     case EXEC_TRAJ:
     {
       static int blk_cnt = 0;
-      if (planner_manager_->grid_map_->useFreeSpaceOnly() && ++blk_cnt >= 50)   // every ~0.5 s
+      if (use_astar_global_ && planner_manager_->grid_map_->useFreeSpaceOnly() && ++blk_cnt >= 50)
       {
         blk_cnt = 0;
         if (globalPathBlocked())
@@ -959,10 +987,16 @@ namespace ego_planner
   bool EGOReplanFSM::planGlobalRoute(const Eigen::Vector3d &goal)
   {
     auto map = planner_manager_->grid_map_;
-    if (map->useFreeSpaceOnly())
+    if (use_astar_global_ && map->useFreeSpaceOnly())
     {
       std::vector<Eigen::Vector3d> path;
       const bool reached = map->searchFreePath(odom_pos_, goal, path);
+      if (!reached && path.size() >= 2 && (path.back() - odom_pos_).norm() < 0.5)
+      {
+        RCLCPP_ERROR(node_->get_logger(),
+                     "Drone is boxed in (start blocked or no free cells around it). Move it to open space.");
+        return false;
+      }
       if (path.size() >= 2)
       {
         if (!reached)
