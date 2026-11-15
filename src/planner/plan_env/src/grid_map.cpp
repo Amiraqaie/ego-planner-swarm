@@ -55,11 +55,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/free_astar_stride", 2);
   node_->declare_parameter("grid_map/free_astar_max_nodes", 400000);
   node_->declare_parameter("grid_map/free_astar_max_seg", 3.0);
-  node_->declare_parameter("grid_map/free_publish_range", 6.0);
-  node_->declare_parameter("grid_map/free_publish_stride", 1);
 
-  node_->get_parameter("grid_map/free_publish_range", mp_.free_publish_range_);
-  node_->get_parameter("grid_map/free_publish_stride", mp_.free_publish_stride_);
   node_->get_parameter("grid_map/free_astar_stride", mp_.free_astar_stride_);
   node_->get_parameter("grid_map/free_astar_max_nodes", mp_.free_astar_max_nodes_);
   node_->get_parameter("grid_map/free_astar_max_seg", mp_.free_astar_max_seg_);
@@ -220,7 +216,6 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   // 发布者
   map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy", 10);
   map_inf_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy_inflate", 10);
-  free_space_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/free_space", 10);
 
   md_.occ_need_update_ = false;
   md_.local_updated_ = false;
@@ -858,7 +853,6 @@ void GridMap::visCallback()
 {
   publishMapInflate(true);
   publishMap();
-  publishFreeSpace();   // NEW
 }
 
 void GridMap::publishFreeSpace()
@@ -1315,46 +1309,6 @@ void GridMap::publishMapInflate(bool all_info)
   map_inf_pub_->publish(cloud_msg);
 
   // RCLCPP_INFO(rclcpp::get_logger("publishMapInflate"), "pub map");
-}
-
-void GridMap::publishFreeSpace()
-{
-  if (free_space_pub_->get_subscription_count() <= 0 || !md_.has_odom_)
-    return;
-
-  const Eigen::Vector3d r = Eigen::Vector3d::Constant(mp_.free_publish_range_);
-  Eigen::Vector3i lo, hi;
-  posToIndex(md_.camera_pos_ - r, lo);
-  posToIndex(md_.camera_pos_ + r, hi);
-  boundIndex(lo);
-  boundIndex(hi);
-
-  const int stride = mp_.free_publish_stride_;
-  pcl::PointCloud<pcl::PointXYZ> cloud;
-  Eigen::Vector3d pos;
-
-  for (int x = lo(0); x <= hi(0); x += stride)
-    for (int y = lo(1); y <= hi(1); y += stride)
-      for (int z = lo(2); z <= hi(2); z += stride)
-      {
-        Eigen::Vector3i id(x, y, z);
-        // known free AND not inside an inflated obstacle
-        if (!isKnownFree(id))
-          continue;
-        indexToPos(id, pos);
-        cloud.push_back(pcl::PointXYZ(
-            static_cast<float>(pos(0)), static_cast<float>(pos(1)), static_cast<float>(pos(2))));
-      }
-
-  cloud.width = cloud.points.size();
-  cloud.height = 1;
-  cloud.is_dense = true;
-  cloud.header.frame_id = mp_.frame_id_;
-
-  sensor_msgs::msg::PointCloud2 msg;
-  pcl::toROSMsg(cloud, msg);
-  msg.header.stamp = node_->now();
-  free_space_pub_->publish(msg);
 }
 
 bool GridMap::odomValid() { return md_.has_odom_; }

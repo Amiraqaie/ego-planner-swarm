@@ -101,8 +101,6 @@ struct MappingParameters
   int free_astar_stride_;        // voxels per A* step
   int free_astar_max_nodes_;     // search budget
   double free_astar_max_seg_;    // m, max waypoint spacing
-  double free_publish_range_;   // m, half-size of the box around the drone that is published
-  int free_publish_stride_;     // 1 = every voxel, 2 = every 2nd voxel per axis, ...
 };
 
 // intermediate mapping data for fusion
@@ -202,7 +200,6 @@ public:
 
   void publishMap();
   void publishMapInflate(bool all_info = false);
-  void publishFreeSpace();
   void publishDepth();
 
   bool hasDepthObservation();
@@ -278,8 +275,7 @@ private:
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_inf_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr free_space_pub_;
-  
+
   rclcpp::TimerBase::SharedPtr occ_timer_;
   rclcpp::TimerBase::SharedPtr vis_timer_;
 
