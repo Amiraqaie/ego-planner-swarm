@@ -52,7 +52,13 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/free_keep_range", 15.0);
   node_->declare_parameter("grid_map/free_publish_range", 6.0);
   node_->declare_parameter("grid_map/free_publish_stride", 1);
+  node_->declare_parameter("grid_map/free_astar_stride", 2);
+  node_->declare_parameter("grid_map/free_astar_max_nodes", 400000);
+  node_->declare_parameter("grid_map/free_astar_max_seg", 3.0);
 
+  node_->get_parameter("grid_map/free_astar_stride", mp_.free_astar_stride_);
+  node_->get_parameter("grid_map/free_astar_max_nodes", mp_.free_astar_max_nodes_);
+  node_->get_parameter("grid_map/free_astar_max_seg", mp_.free_astar_max_seg_);
   node_->get_parameter("grid_map/resolution", mp_.resolution_);
   node_->get_parameter("grid_map/map_size_x", x_size);
   node_->get_parameter("grid_map/map_size_y", y_size);
@@ -230,6 +236,122 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   // rand_noise2_ = normal_distribution<double>(0, 0.2);
   // random_device rd;
   // eng_ = default_random_engine(rd());
+}
+
+bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
+                             std::vector<Eigen::Vector3d> &path)
+{
+  path.clear();
+  if (!isInMap(start) || !isInMap(goal))
+    return false;
+
+  const int s = std::max(1, mp_.free_astar_stride_);
+  const int ny = mp_.map_voxel_num_(1);
+  const int nz = mp_.map_voxel_num_(2);
+
+  auto passable = [&](const Eigen::Vector3i &id) {
+    if (!isInMap(id))
+      return false;
+    const int a = toAddress(id);
+    return md_.free_buffer_[a] == 1 && md_.occupancy_buffer_inflate_[a] == 0;
+  };
+  auto toId = [&](int a) {
+    return Eigen::Vector3i(a / (ny * nz), (a / nz) % ny, a % nz);
+  };
+
+  Eigen::Vector3i si, gi;
+  posToIndex(start, si);
+  posToIndex(goal, gi);
+  auto h = [&](const Eigen::Vector3i &id) { return static_cast<float>((id - gi).cast<float>().norm()); };
+
+  struct Q { float f; int adr; };
+  auto cmp = [](const Q &a, const Q &b) { return a.f > b.f; };
+  std::priority_queue<Q, std::vector<Q>, decltype(cmp)> open(cmp);
+  std::unordered_map<int, float> g;
+  std::unordered_map<int, int> parent;
+
+  const int s_adr = toAddress(si);
+  g[s_adr] = 0.f;
+  parent[s_adr] = -1;
+  open.push({h(si), s_adr});
+
+  int best = s_adr, goal_adr = -1, expanded = 0;
+  float best_h = h(si);
+
+  while (!open.empty() && expanded < mp_.free_astar_max_nodes_)
+  {
+    const Q cur = open.top();
+    open.pop();
+    const Eigen::Vector3i id = toId(cur.adr);
+    const float gc = g[cur.adr];
+    if (cur.f - h(id) > gc + 1e-3f)
+      continue;   // stale queue entry
+    ++expanded;
+
+    const float hc = h(id);
+    if (hc < best_h) { best_h = hc; best = cur.adr; }
+    if ((id - gi).cwiseAbs().maxCoeff() <= s) { goal_adr = cur.adr; break; }
+
+    for (int dx = -1; dx <= 1; ++dx)
+      for (int dy = -1; dy <= 1; ++dy)
+        for (int dz = -1; dz <= 1; ++dz)
+        {
+          if (dx == 0 && dy == 0 && dz == 0)
+            continue;
+          const Eigen::Vector3i nb = id + Eigen::Vector3i(dx, dy, dz) * s;
+          if (!passable(nb))
+            continue;
+          const int na = toAddress(nb);
+          const float ng = gc + s * std::sqrt(static_cast<float>(dx * dx + dy * dy + dz * dz));
+          auto it = g.find(na);
+          if (it != g.end() && it->second <= ng)
+            continue;
+          g[na] = ng;
+          parent[na] = cur.adr;
+          open.push({ng + h(nb), na});
+        }
+  }
+
+  const bool reached = goal_adr >= 0;
+  std::vector<Eigen::Vector3d> raw;
+  for (int a = reached ? goal_adr : best; a != -1; a = parent[a])
+  {
+    Eigen::Vector3d p;
+    indexToPos(toId(a), p);
+    raw.push_back(p);
+  }
+  std::reverse(raw.begin(), raw.end());
+  if (raw.size() < 2)
+    return false;
+  raw.front() = start;
+  if (reached)
+    raw.back() = goal;
+
+  // string-pulling: skip nodes while the straight segment stays passable
+  auto segFree = [&](const Eigen::Vector3d &a, const Eigen::Vector3d &b) {
+    const double len = (b - a).norm();
+    for (double d = 0.0; d <= len; d += mp_.resolution_)
+    {
+      Eigen::Vector3i id;
+      posToIndex(a + (b - a) * (len > 1e-6 ? d / len : 0.0), id);
+      if (!passable(id))
+        return false;
+    }
+    return true;
+  };
+
+  path.push_back(raw.front());
+  size_t i = 0;
+  while (i + 1 < raw.size())
+  {
+    size_t j = raw.size() - 1;
+    while (j > i + 1 &&
+           ((raw[j] - raw[i]).norm() > mp_.free_astar_max_seg_ || !segFree(raw[i], raw[j])))
+      --j;
+    path.push_back(raw[j]);
+    i = j;
+  }
+  return reached;
 }
 
 void GridMap::resetBuffer()
@@ -879,6 +1001,16 @@ void GridMap::freeCloudCallback(const sensor_msgs::msg::PointCloud2::ConstShared
         for (int z = lo_id(2); z <= hi_id(2); ++z)
           md_.free_buffer_[toAddress(x, y, z)] = 1;
   }
+}
+
+bool GridMap::isUnseen(const Eigen::Vector3d &pos)
+{
+  if (!isInMap(pos))
+    return true;
+  Eigen::Vector3i id;
+  posToIndex(pos, id);
+  const int a = toAddress(id);
+  return md_.free_buffer_[a] == 0 && md_.occupancy_buffer_inflate_[a] == 0;
 }
 
 void GridMap::trimFreeBuffer()

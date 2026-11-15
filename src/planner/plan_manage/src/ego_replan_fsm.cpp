@@ -192,9 +192,7 @@ namespace ego_planner
 
   void EGOReplanFSM::planNextWaypoint(const Eigen::Vector3d next_wp, bool restart)
   {
-    bool success = planner_manager_->planGlobalTraj(
-        odom_pos_, odom_vel_, Eigen::Vector3d::Zero(),
-        next_wp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    bool success = planGlobalRoute(next_wp);
 
     if (success)
     {
@@ -612,6 +610,8 @@ namespace ego_planner
       }
       else
       {
+        if (planner_manager_->grid_map_->useFreeSpaceOnly() && continously_called_times_ % 5 == 0)
+          planGlobalRoute(end_pt_);   // repeated failure: the global route itself may be bad
         changeFSMExecState(REPLAN_TRAJ, "FSM");
       }
 
@@ -620,6 +620,21 @@ namespace ego_planner
 
     case EXEC_TRAJ:
     {
+      static int blk_cnt = 0;
+      if (planner_manager_->grid_map_->useFreeSpaceOnly() && ++blk_cnt >= 50)   // every ~0.5 s
+      {
+        blk_cnt = 0;
+        if (globalPathBlocked())
+        {
+          RCLCPP_WARN(node_->get_logger(), "Global path blocked, re-routing");
+          if (planGlobalRoute(end_pt_))
+          {
+            have_new_target_ = true;
+            changeFSMExecState(REPLAN_TRAJ, "GLOBAL");
+            break;
+          }
+        }
+      }
       /* determine if need to replan */
       LocalTrajData *info = &planner_manager_->local_data_;
       rclcpp::Time time_now = rclcpp::Clock().now();
@@ -941,6 +956,53 @@ namespace ego_planner
     broadcast_bspline_pub_->publish(bspline);
   }
 
+  bool EGOReplanFSM::planGlobalRoute(const Eigen::Vector3d &goal)
+  {
+    auto map = planner_manager_->grid_map_;
+    if (map->useFreeSpaceOnly())
+    {
+      std::vector<Eigen::Vector3d> path;
+      const bool reached = map->searchFreePath(odom_pos_, goal, path);
+      if (path.size() >= 2)
+      {
+        if (!reached)
+          RCLCPP_WARN(node_->get_logger(),
+                      "Goal not reachable through known free space, routing to the closest reachable point");
+        std::vector<Eigen::Vector3d> wps(path.begin() + 1, path.end());
+        if (planner_manager_->planGlobalTrajWaypoints(
+                odom_pos_, odom_vel_, Eigen::Vector3d::Zero(),
+                wps, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()))
+        {
+          RCLCPP_INFO(node_->get_logger(), "Free-space A* route: %zu waypoints", wps.size());
+          return true;
+        }
+      }
+      RCLCPP_WARN(node_->get_logger(), "Free-space A* failed, using straight line");
+    }
+    return planner_manager_->planGlobalTraj(
+        odom_pos_, odom_vel_, Eigen::Vector3d::Zero(),
+        goal, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+  }
+
+  bool EGOReplanFSM::globalPathBlocked()
+  {
+    auto &gd = planner_manager_->global_data_;
+    auto map = planner_manager_->grid_map_;
+    double travelled = 0.0;
+    Eigen::Vector3d last = odom_pos_;
+    for (double t = gd.last_progress_time_; t < gd.global_duration_ && travelled < planning_horizen_; t += 0.05)
+    {
+      const Eigen::Vector3d p = gd.getPosition(t);
+      travelled += (p - last).norm();
+      last = p;
+      if ((p - odom_pos_).norm() < 0.3)
+        continue;   // ignore the voxels around the body
+      if (map->getInflateOccupancy(p) != 0)
+        return true;
+    }
+    return false;
+  }
+
   bool EGOReplanFSM::callEmergencyStop(Eigen::Vector3d stop_pos)
   {
 
@@ -1033,9 +1095,9 @@ namespace ego_planner
       local_target_vel_ = planner_manager_->global_data_.getVelocity(t);
     }
 
-    // free-space-only: pull the local target back to known free space
+    // free-space-only: pull the local target back only if it is in UNSEEN space
     auto map = planner_manager_->grid_map_;
-    if (map->getInflateOccupancy(local_target_pt_) != 0)
+    if (map->useFreeSpaceOnly() && map->isUnseen(local_target_pt_))
     {
       Eigen::Vector3d dir = start_pt_ - local_target_pt_;
       const double len = dir.norm();
@@ -1049,7 +1111,7 @@ namespace ego_planner
           if (map->getInflateOccupancy(p) == 0)
           {
             local_target_pt_ = p;
-            local_target_vel_.setZero();   // stop at the frontier
+            local_target_vel_.setZero();
             break;
           }
         }

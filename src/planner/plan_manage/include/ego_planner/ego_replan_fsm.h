@@ -113,6 +113,8 @@ namespace ego_planner
     void readGivenWps();
     void planNextWaypoint(const Eigen::Vector3d next_wp, bool restart = false);
     void getLocalTarget();
+    bool planGlobalRoute(const Eigen::Vector3d &goal);
+    bool globalPathBlocked();
 
     /* ROS functions */
     void execFSMCallback();

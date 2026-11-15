@@ -8,6 +8,7 @@
 #include <iostream>
 #include <algorithm>
 #include <random>
+#include <unordered_map>
 #include <nav_msgs/msg/odometry.hpp>
 #include <queue>
 #include <rclcpp/rclcpp.hpp>
@@ -95,6 +96,9 @@ struct MappingParameters
   double free_dilate_angle_;   // rad, ~ angular spacing between rays
   int free_dilate_max_;        // cap in voxels
   double free_keep_range_;     // m, <=0: never forget
+  int free_astar_stride_;        // voxels per A* step
+  int free_astar_max_nodes_;     // search budget
+  double free_astar_max_seg_;    // m, max waypoint spacing
   double free_publish_range_;   // m, half-size of the box around the drone that is published
   int free_publish_stride_;     // 1 = every voxel, 2 = every 2nd voxel per axis, ...
 };
@@ -206,7 +210,10 @@ public:
   Eigen::Vector3d getOrigin();
   int getVoxelNum();
   bool getOdomDepthTimeout() { return md_.flag_depth_odom_timeout_; }
-
+  bool useFreeSpaceOnly() { return mp_.use_free_space_only_; }
+  bool isUnseen(const Eigen::Vector3d &pos);   // not seen free, not obstacle
+  bool searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
+                      std::vector<Eigen::Vector3d> &path);
   typedef std::shared_ptr<GridMap> Ptr;
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
