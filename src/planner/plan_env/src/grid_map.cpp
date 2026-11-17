@@ -1110,7 +1110,7 @@ void GridMap::freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedP
                               md_.camera_pos_(1) + mp_.free_keep_range_,
                               md_.camera_pos_(2) + mp_.free_keep_range_);
 
-  auto addLeaf = [&](octomap::OcTree::leaf_iterator &it) {
+  auto addLeaf = [&](octomap::OcTree::leaf_bbx_iterator &it) {
     if (tree->isNodeOccupied(*it))
       return;
     const double h = it.getSize() * 0.5;
