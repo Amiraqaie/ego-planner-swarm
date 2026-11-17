@@ -29,6 +29,7 @@ find_package(PCL REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(octomap_msgs REQUIRED)
 find_package(octomap REQUIRED)
+
 include_directories(${OCTOMAP_INCLUDE_DIRS})
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -54,13 +55,33 @@ link_directories(${PCL_LIBRARY_DIRS})
 
 ament_export_include_directories(include)
 
+ament_export_dependencies(
+    rclcpp
+    std_msgs
+    visualization_msgs
+    geometry_msgs
+    nav_msgs
+    octomap_msgs
+    pcl_conversions
+)
+
 add_library( plan_env SHARED
     src/grid_map.cpp 
     src/raycast.cpp
     src/obj_predictor.cpp 
     )
 
-ament_target_dependencies(plan_env octomap_msgs std_msgs visualization_msgs geometry_msgs nav_msgs rclcpp Eigen3 PCL cv_bridge message_filters pcl_conversions)
+ament_target_dependencies(plan_env
+    rclcpp
+    octomap_msgs
+    std_msgs
+    visualization_msgs
+    geometry_msgs
+    nav_msgs
+    cv_bridge
+    message_filters
+    pcl_conversions
+)
 
 target_link_libraries( plan_env 
   ${PCL_LIBRARIES}
