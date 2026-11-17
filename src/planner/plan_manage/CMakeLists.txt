@@ -27,7 +27,8 @@ find_package(std_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(pcl_conversions REQUIRED)
-
+find_package(octomap_msgs REQUIRED)
+find_package(octomap REQUIRED)
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
@@ -63,12 +64,15 @@ ament_target_dependencies(ego_planner_node
                           geometry_msgs quadrotor_msgs 
                           plan_env path_searching 
                           bspline_opt traj_utils 
-                          cv_bridge pcl_conversions )
+                          cv_bridge pcl_conversions
+                          octomap_msgs octomap
+                          )
 
 find_library(TRAJ_UTILS_LIB traj_utils_lib PATHS ${traj_utils_LIBRARY_DIRS})
 
 target_link_libraries(ego_planner_node
     ${TRAJ_UTILS_LIB}
+    ${OCTOMAP_LIBRARIES}
 )
 
 add_executable(traj_server src/traj_server.cpp)

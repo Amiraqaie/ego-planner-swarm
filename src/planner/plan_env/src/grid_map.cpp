@@ -55,6 +55,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/free_astar_stride", 2);
   node_->declare_parameter("grid_map/free_astar_max_nodes", 400000);
   node_->declare_parameter("grid_map/free_astar_max_seg", 3.0);
+  node_->declare_parameter("grid_map/free_source", std::string("scan_cloud"));
 
   node_->get_parameter("grid_map/free_astar_stride", mp_.free_astar_stride_);
   node_->get_parameter("grid_map/free_astar_max_nodes", mp_.free_astar_max_nodes_);
@@ -102,6 +103,11 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/free_keep_range", mp_.free_keep_range_);
   node_->get_parameter("grid_map/free_publish_range", mp_.free_publish_range_);
   node_->get_parameter("grid_map/free_publish_stride", mp_.free_publish_stride_);
+  std::string free_source;
+  node_->get_parameter("grid_map/free_source", free_source);
+  mp_.free_from_octomap_ = (free_source == "octomap");
+  if (!mp_.free_from_octomap_ && free_source != "scan_cloud")
+    RCLCPP_WARN(node_->get_logger(), "free_source '%s' unknown, using scan_cloud", free_source.c_str());
   mp_.free_publish_stride_ = std::max(1, mp_.free_publish_stride_);
 
   if (mp_.virtual_ceil_height_ - mp_.ground_height_ > z_size)
@@ -193,9 +199,18 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   indep_odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
       "grid_map/odom", 10, std::bind(&GridMap::odomCallback, this, std::placeholders::_1));
 
-  free_cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "grid_map/free_cloud", rclcpp::QoS(5),
-      std::bind(&GridMap::freeCloudCallback, this, std::placeholders::_1));
+  if (mp_.free_from_octomap_)
+  {
+    free_octomap_sub_ = node_->create_subscription<octomap_msgs::msg::Octomap>(
+        "grid_map/free_octomap", rclcpp::QoS(1),
+        std::bind(&GridMap::freeOctomapCallback, this, std::placeholders::_1));
+  }
+  else
+  {
+    free_cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+        "grid_map/free_cloud", rclcpp::QoS(5),
+        std::bind(&GridMap::freeCloudCallback, this, std::placeholders::_1));
+  }
 
   free_trim_timer_ = node_->create_wall_timer(
       std::chrono::seconds(1), std::bind(&GridMap::trimFreeBuffer, this));
@@ -1037,20 +1052,7 @@ void GridMap::freeCloudCallback(const sensor_msgs::msg::PointCloud2::ConstShared
   }
 
   // lidar min range leaves unknown voxels around the body: force them free
-  if (md_.has_odom_ && mp_.free_around_odom_ > 0.0)
-  {
-    Eigen::Vector3d lo = md_.camera_pos_ - Eigen::Vector3d::Constant(mp_.free_around_odom_);
-    Eigen::Vector3d hi = md_.camera_pos_ + Eigen::Vector3d::Constant(mp_.free_around_odom_);
-    Eigen::Vector3i lo_id, hi_id;
-    posToIndex(lo, lo_id);
-    posToIndex(hi, hi_id);
-    boundIndex(lo_id);
-    boundIndex(hi_id);
-    for (int x = lo_id(0); x <= hi_id(0); ++x)
-      for (int y = lo_id(1); y <= hi_id(1); ++y)
-        for (int z = lo_id(2); z <= hi_id(2); ++z)
-          md_.free_buffer_[toAddress(x, y, z)] = 1;
-  }
+  forceFreeAroundOdom();
 }
 
 bool GridMap::isUnseen(const Eigen::Vector3d &pos)
@@ -1063,9 +1065,97 @@ bool GridMap::isUnseen(const Eigen::Vector3d &pos)
   return md_.free_buffer_[a] == 0 && md_.occupancy_buffer_inflate_[a] == 0;
 }
 
+void GridMap::forceFreeAroundOdom()
+{
+  // lidar min range leaves unknown voxels around the body: force them free
+  if (!md_.has_odom_ || mp_.free_around_odom_ <= 0.0)
+    return;
+  Eigen::Vector3i lo_id, hi_id;
+  posToIndex(md_.camera_pos_ - Eigen::Vector3d::Constant(mp_.free_around_odom_), lo_id);
+  posToIndex(md_.camera_pos_ + Eigen::Vector3d::Constant(mp_.free_around_odom_), hi_id);
+  boundIndex(lo_id);
+  boundIndex(hi_id);
+  for (int x = lo_id(0); x <= hi_id(0); ++x)
+    for (int y = lo_id(1); y <= hi_id(1); ++y)
+      for (int z = lo_id(2); z <= hi_id(2); ++z)
+        md_.free_buffer_[toAddress(x, y, z)] = 1;
+}
+
+void GridMap::freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedPtr msg)
+{
+  if (!mp_.use_free_space_only_)
+    return;
+
+  std::unique_ptr<octomap::AbstractOcTree> abstract(octomap_msgs::fullMsgToMap(*msg));
+  octomap::OcTree *tree = dynamic_cast<octomap::OcTree *>(abstract.get());
+  if (!tree)
+  {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                         "free_octomap: need an octomap_full message holding an OcTree");
+    return;
+  }
+
+  // the octomap is the whole truth: replace, do not accumulate
+  std::fill(md_.free_buffer_.begin(), md_.free_buffer_.end(), 0);
+
+  const int ny = mp_.map_voxel_num_(1);
+  const int nz = mp_.map_voxel_num_(2);
+
+  // only import a box around the drone (free_keep_range <= 0: whole octomap)
+  const bool crop = mp_.free_keep_range_ > 0.0 && md_.has_odom_;
+  const octomap::point3d bmin(md_.camera_pos_(0) - mp_.free_keep_range_,
+                              md_.camera_pos_(1) - mp_.free_keep_range_,
+                              md_.camera_pos_(2) - mp_.free_keep_range_);
+  const octomap::point3d bmax(md_.camera_pos_(0) + mp_.free_keep_range_,
+                              md_.camera_pos_(1) + mp_.free_keep_range_,
+                              md_.camera_pos_(2) + mp_.free_keep_range_);
+
+  auto addLeaf = [&](octomap::OcTree::leaf_iterator &it) {
+    if (tree->isNodeOccupied(*it))
+      return;
+    const double h = it.getSize() * 0.5;
+    const octomap::point3d c = it.getCoordinate();
+    Eigen::Vector3i lo, hi;
+    for (int i = 0; i < 3; ++i)
+    {
+      lo(i) = static_cast<int>(floor((c(i) - h - mp_.map_origin_(i)) * mp_.resolution_inv_ + 1e-3));
+      hi(i) = static_cast<int>(ceil((c(i) + h - mp_.map_origin_(i)) * mp_.resolution_inv_ - 1e-3)) - 1;
+      if (hi(i) < lo(i))
+        hi(i) = lo(i);                       // leaf smaller than an EGO voxel
+      if (hi(i) < 0 || lo(i) >= mp_.map_voxel_num_(i))
+        return;                              // outside the EGO map
+      lo(i) = std::max(lo(i), 0);
+      hi(i) = std::min(hi(i), mp_.map_voxel_num_(i) - 1);
+    }
+    // split the leaf into EGO-resolution voxels (z is contiguous in memory)
+    for (int x = lo(0); x <= hi(0); ++x)
+      for (int y = lo(1); y <= hi(1); ++y)
+      {
+        char *row = md_.free_buffer_.data() + (static_cast<size_t>(x) * ny + y) * nz;
+        std::fill(row + lo(2), row + hi(2) + 1, 1);
+      }
+  };
+
+  if (crop)
+  {
+    for (auto it = tree->begin_leafs_bbx(bmin, bmax), end = tree->end_leafs_bbx(); it != end; ++it)
+    {
+      octomap::OcTree::leaf_iterator li(it);
+      addLeaf(li);
+    }
+  }
+  else
+  {
+    for (auto it = tree->begin_leafs(), end = tree->end_leafs(); it != end; ++it)
+      addLeaf(it);
+  }
+
+  forceFreeAroundOdom();
+}
+
 void GridMap::trimFreeBuffer()
 {
-  if (!mp_.use_free_space_only_ || mp_.free_keep_range_ <= 0.0 || !md_.has_odom_)
+  if (mp_.free_from_octomap_ || !mp_.use_free_space_only_ || mp_.free_keep_range_ <= 0.0 || !md_.has_odom_)
     return;
 
   const Eigen::Vector3d r = Eigen::Vector3d::Constant(mp_.free_keep_range_);

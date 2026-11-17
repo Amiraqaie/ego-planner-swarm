@@ -18,7 +18,9 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
-
+#include <octomap/octomap.h>
+#include <octomap_msgs/msg/octomap.hpp>
+#include <octomap_msgs/conversions.h>
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/sync_policies/exact_time.h>
@@ -98,6 +100,7 @@ struct MappingParameters
   double free_keep_range_;     // m, <=0: never forget
   double free_publish_range_;    // m, box around the drone to publish (<=0: whole map)
   int free_publish_stride_;      // publish every Nth voxel per axis
+  bool free_from_octomap_;       // true: free space comes from octomap_full (replace), false: per-scan cloud (accumulate)
   int free_astar_stride_;        // voxels per A* step
   int free_astar_max_nodes_;     // search budget
   double free_astar_max_seg_;    // m, max waypoint spacing
@@ -231,6 +234,8 @@ private:
 
   void freeCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void trimFreeBuffer();
+  void freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedPtr msg);
+  void forceFreeAroundOdom();
   void publishFreeSpace();
 
   // update occupancy by raycasting
@@ -269,6 +274,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr extrinsic_sub_;
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr free_cloud_sub_;
+  rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr free_octomap_sub_;
   rclcpp::TimerBase::SharedPtr free_trim_timer_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr free_space_pub_;
   rclcpp::TimerBase::SharedPtr free_pub_timer_;
