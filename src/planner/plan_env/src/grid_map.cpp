@@ -1110,7 +1110,7 @@ void GridMap::freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedP
                               md_.camera_pos_(1) + mp_.free_keep_range_,
                               md_.camera_pos_(2) + mp_.free_keep_range_);
 
-  auto addLeaf = [&](octomap::OcTree::leaf_bbx_iterator &it) {
+  auto addLeaf = [&](const auto &it) {
     if (tree->isNodeOccupied(*it))
       return;
     const double h = it.getSize() * 0.5;
@@ -1139,10 +1139,7 @@ void GridMap::freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedP
   if (crop)
   {
     for (auto it = tree->begin_leafs_bbx(bmin, bmax), end = tree->end_leafs_bbx(); it != end; ++it)
-    {
-      auto& li = it;
-      addLeaf(li);
-    }
+      addLeaf(it);
   }
   else
   {
