@@ -1140,7 +1140,7 @@ void GridMap::freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedP
   {
     for (auto it = tree->begin_leafs_bbx(bmin, bmax), end = tree->end_leafs_bbx(); it != end; ++it)
     {
-      octomap::OcTree::leaf_iterator li(it);
+      auto& li = it;
       addLeaf(li);
     }
   }
