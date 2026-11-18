@@ -14,7 +14,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <tuple>
 #include <visualization_msgs/msg/marker.hpp>
-#include <visualization_msgs/msg/marker_array.hpp>
+
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
@@ -46,14 +46,6 @@ struct matrix_hash : std::unary_function<T, size_t>
     }
     return seed;
   }
-};
-
-struct Frontier
-{
-  std::vector<Eigen::Vector3d> cells_;           // all cells (voxel centres)
-  std::vector<Eigen::Vector3d> filtered_cells_;  // downsampled
-  Eigen::Vector3d average_, box_min_, box_max_;
-  int id_;
 };
 
 // constant parameters
@@ -112,12 +104,6 @@ struct MappingParameters
   int free_astar_stride_;        // voxels per A* step
   int free_astar_max_nodes_;     // search budget
   double free_astar_max_seg_;    // m, max waypoint spacing
-  /* frontiers */
-  double frontier_range_xy_, frontier_range_z_;   // m, search box half-size around the drone
-  double frontier_cluster_size_xy_;               // m, split clusters larger than this
-  double frontier_min_z_;                         // m, ignore frontier cells below this height
-  int frontier_cluster_min_;                      // min cells per cluster
-  int frontier_down_sample_;                      // voxel-grid factor for filtered cells
 };
 
 // intermediate mapping data for fusion
@@ -130,7 +116,7 @@ struct MappingData
   std::vector<char> occupancy_buffer_inflate_;
 
   std::vector<char> free_buffer_;   // 1 = seen as free by octomap, 0 = unknown
-  std::vector<char> frontier_flag_;
+
   // camera position and pose data
 
   Eigen::Vector3d camera_pos_, last_camera_pos_;
@@ -230,7 +216,6 @@ public:
   bool isUnseen(const Eigen::Vector3d &pos);   // not seen free, not obstacle
   bool searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
                       std::vector<Eigen::Vector3d> &path);
-  const std::vector<Frontier> &getFrontiers() const { return frontiers_; }
   typedef std::shared_ptr<GridMap> Ptr;
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -252,13 +237,7 @@ private:
   void freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedPtr msg);
   void forceFreeAroundOdom();
   void publishFreeSpace();
-  void searchFrontiers();
-  void publishFrontiers();
-  void expandFrontier(const Eigen::Vector3i &first, const Eigen::Vector3i &lo,
-                      const Eigen::Vector3i &hi, std::vector<Frontier> &out);
-  bool isFrontierCell(const Eigen::Vector3i &id);
-  void computeFrontierInfo(Frontier &ftr);
-  bool splitHorizontally(const Frontier &ftr, std::vector<Frontier> &splits, int depth);
+
   // update occupancy by raycasting
   void updateOccupancyCallback();
   void visCallback();
@@ -299,12 +278,6 @@ private:
   rclcpp::TimerBase::SharedPtr free_trim_timer_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr free_space_pub_;
   rclcpp::TimerBase::SharedPtr free_pub_timer_;
-
-  std::vector<Frontier> frontiers_;
-  std::vector<int> frontier_touched_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr frontier_cloud_pub_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr frontier_marker_pub_;
-  rclcpp::TimerBase::SharedPtr frontier_timer_;
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_inf_pub_;

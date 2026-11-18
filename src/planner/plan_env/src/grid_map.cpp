@@ -1,5 +1,4 @@
 #include "plan_env/grid_map.h"
-#include <pcl/filters/voxel_grid.h>
 
 // #define current_img_ md_.depth_image_[image_cnt_ & 1]
 // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
@@ -57,12 +56,6 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/free_astar_max_nodes", 400000);
   node_->declare_parameter("grid_map/free_astar_max_seg", 3.0);
   node_->declare_parameter("grid_map/free_source", std::string("scan_cloud"));
-  node_->declare_parameter("grid_map/frontier_range_xy", 8.0);
-  node_->declare_parameter("grid_map/frontier_range_z", 2.0);
-  node_->declare_parameter("grid_map/frontier_cluster_size_xy", 3.0);
-  node_->declare_parameter("grid_map/frontier_min_z", -100.0);
-  node_->declare_parameter("grid_map/frontier_cluster_min", 30);
-  node_->declare_parameter("grid_map/frontier_down_sample", 3);
 
   node_->get_parameter("grid_map/free_astar_stride", mp_.free_astar_stride_);
   node_->get_parameter("grid_map/free_astar_max_nodes", mp_.free_astar_max_nodes_);
@@ -110,14 +103,6 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->get_parameter("grid_map/free_keep_range", mp_.free_keep_range_);
   node_->get_parameter("grid_map/free_publish_range", mp_.free_publish_range_);
   node_->get_parameter("grid_map/free_publish_stride", mp_.free_publish_stride_);
-  node_->get_parameter("grid_map/frontier_range_xy", mp_.frontier_range_xy_);
-  node_->get_parameter("grid_map/frontier_range_z", mp_.frontier_range_z_);
-  node_->get_parameter("grid_map/frontier_cluster_size_xy", mp_.frontier_cluster_size_xy_);
-  node_->get_parameter("grid_map/frontier_min_z", mp_.frontier_min_z_);
-  node_->get_parameter("grid_map/frontier_cluster_min", mp_.frontier_cluster_min_);
-  node_->get_parameter("grid_map/frontier_down_sample", mp_.frontier_down_sample_);
-  mp_.frontier_down_sample_ = std::max(1, mp_.frontier_down_sample_);
-
   std::string free_source;
   node_->get_parameter("grid_map/free_source", free_source);
   mp_.free_from_octomap_ = (free_source == "octomap");
@@ -165,7 +150,6 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   md_.flag_rayend_ = vector<char>(buffer_size, -1);
   md_.flag_traverse_ = vector<char>(buffer_size, -1);
   md_.free_buffer_ = vector<char>(buffer_size, 0);
-  md_.frontier_flag_ = vector<char>(buffer_size, 0);
 
   md_.raycast_num_ = 0;
 
@@ -234,12 +218,6 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
       "grid_map/free_space", 10);
   free_pub_timer_ = node_->create_wall_timer(
       std::chrono::milliseconds(200), std::bind(&GridMap::publishFreeSpace, this));
-  frontier_cloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "grid_map/frontier_cells", 10);
-  frontier_marker_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
-      "grid_map/frontier_markers", 10);
-  frontier_timer_ = node_->create_wall_timer(
-      std::chrono::milliseconds(500), std::bind(&GridMap::publishFrontiers, this));
 
   // 定时器
   occ_timer_ = node_->create_wall_timer(
@@ -273,298 +251,6 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   // rand_noise2_ = normal_distribution<double>(0, 0.2);
   // random_device rd;
   // eng_ = default_random_engine(rd());
-}
-
-bool GridMap::isFrontierCell(const Eigen::Vector3i &id)
-{
-  if (!isInMap(id))
-    return false;
-  if ((id(2) + 0.5) * mp_.resolution_ + mp_.map_origin_(2) < mp_.frontier_min_z_)
-    return false;   // ground noise
-
-  const int a = toAddress(id);
-  // known free and not inside an inflated obstacle
-  if (md_.free_buffer_[a] != 1 || md_.occupancy_buffer_inflate_[a] != 0)
-    return false;
-
-  static const int d[6][3] = {{-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}};
-  for (int k = 0; k < 6; ++k)
-  {
-    const Eigen::Vector3i nb(id(0) + d[k][0], id(1) + d[k][1], id(2) + d[k][2]);
-    if (!isInMap(nb))
-      continue;   // the map border is not a frontier
-    const int na = toAddress(nb);
-    // unknown = never seen free and not an obstacle (same rule as isUnseen())
-    if (md_.free_buffer_[na] == 0 && md_.occupancy_buffer_inflate_[na] == 0)
-      return true;
-  }
-  return false;
-}
-
-void GridMap::computeFrontierInfo(Frontier &ftr)
-{
-  ftr.average_.setZero();
-  ftr.box_min_ = ftr.cells_.front();
-  ftr.box_max_ = ftr.cells_.front();
-  for (const auto &c : ftr.cells_)
-  {
-    ftr.average_ += c;
-    ftr.box_min_ = ftr.box_min_.cwiseMin(c);
-    ftr.box_max_ = ftr.box_max_.cwiseMax(c);
-  }
-  ftr.average_ /= double(ftr.cells_.size());
-
-  // downsample like FUEL (voxel grid)
-  pcl::PointCloud<pcl::PointXYZ>::Ptr in(new pcl::PointCloud<pcl::PointXYZ>);
-  pcl::PointCloud<pcl::PointXYZ>::Ptr out(new pcl::PointCloud<pcl::PointXYZ>);
-  for (const auto &c : ftr.cells_)
-    in->points.emplace_back(c(0), c(1), c(2));
-  in->width = in->points.size();
-  in->height = 1;
-  const float leaf = static_cast<float>(mp_.resolution_ * mp_.frontier_down_sample_);
-  pcl::VoxelGrid<pcl::PointXYZ> vg;
-  vg.setInputCloud(in);
-  vg.setLeafSize(leaf, leaf, leaf);
-  vg.filter(*out);
-  ftr.filtered_cells_.clear();
-  for (const auto &p : out->points)
-    ftr.filtered_cells_.emplace_back(p.x, p.y, p.z);
-}
-
-bool GridMap::splitHorizontally(const Frontier &ftr, std::vector<Frontier> &splits, int depth)
-{
-  if (depth > 4 || ftr.cells_.size() < 2 || ftr.filtered_cells_.empty())
-    return false;
-
-  const Eigen::Vector2d mean = ftr.average_.head<2>();
-  bool need_split = false;
-  for (const auto &c : ftr.filtered_cells_)
-    if ((c.head<2>() - mean).norm() > mp_.frontier_cluster_size_xy_)
-    {
-      need_split = true;
-      break;
-    }
-  if (!need_split)
-    return false;
-
-  // PCA of the xy covariance
-  Eigen::Matrix2d cov = Eigen::Matrix2d::Zero();
-  for (const auto &c : ftr.filtered_cells_)
-  {
-    const Eigen::Vector2d diff = c.head<2>() - mean;
-    cov += diff * diff.transpose();
-  }
-  cov /= double(ftr.filtered_cells_.size());
-  Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(cov);
-  const Eigen::Vector2d first_pc = es.eigenvectors().col(1);   // largest eigenvalue is last
-
-  Frontier f1, f2;
-  for (const auto &c : ftr.cells_)
-  {
-    if ((c.head<2>() - mean).dot(first_pc) >= 0)
-      f1.cells_.push_back(c);
-    else
-      f2.cells_.push_back(c);
-  }
-  if (f1.cells_.empty() || f2.cells_.empty())
-    return false;
-  computeFrontierInfo(f1);
-  computeFrontierInfo(f2);
-
-  std::vector<Frontier> s2;
-  if (splitHorizontally(f1, s2, depth + 1))
-  {
-    splits.insert(splits.end(), s2.begin(), s2.end());
-    s2.clear();
-  }
-  else
-    splits.push_back(f1);
-
-  if (splitHorizontally(f2, s2, depth + 1))
-    splits.insert(splits.end(), s2.begin(), s2.end());
-  else
-    splits.push_back(f2);
-  return true;
-}
-
-void GridMap::expandFrontier(const Eigen::Vector3i &first, const Eigen::Vector3i &lo,
-                             const Eigen::Vector3i &hi, std::vector<Frontier> &out)
-{
-  std::queue<Eigen::Vector3i> q;
-  std::vector<Eigen::Vector3d> cells;
-  Eigen::Vector3d pos;
-
-  indexToPos(first, pos);
-  cells.push_back(pos);
-  q.push(first);
-  const int a0 = toAddress(first);
-  md_.frontier_flag_[a0] = 1;
-  frontier_touched_.push_back(a0);
-
-  while (!q.empty())
-  {
-    const Eigen::Vector3i cur = q.front();
-    q.pop();
-    for (int dx = -1; dx <= 1; ++dx)
-      for (int dy = -1; dy <= 1; ++dy)
-        for (int dz = -1; dz <= 1; ++dz)
-        {
-          if (dx == 0 && dy == 0 && dz == 0)
-            continue;
-          const Eigen::Vector3i nb(cur(0) + dx, cur(1) + dy, cur(2) + dz);
-          if ((nb.array() < lo.array()).any() || (nb.array() > hi.array()).any())
-            continue;   // stay inside the search box
-          const int a = toAddress(nb);
-          if (md_.frontier_flag_[a] || !isFrontierCell(nb))
-            continue;
-          md_.frontier_flag_[a] = 1;
-          frontier_touched_.push_back(a);
-          indexToPos(nb, pos);
-          cells.push_back(pos);
-          q.push(nb);
-        }
-  }
-
-  if (static_cast<int>(cells.size()) > mp_.frontier_cluster_min_)
-  {
-    Frontier f;
-    f.cells_ = std::move(cells);
-    computeFrontierInfo(f);
-    out.push_back(std::move(f));
-  }
-}
-
-void GridMap::searchFrontiers()
-{
-  frontiers_.clear();
-  if (!md_.has_odom_)
-    return;
-
-  const Eigen::Vector3d r(mp_.frontier_range_xy_, mp_.frontier_range_xy_, mp_.frontier_range_z_);
-  Eigen::Vector3i lo, hi;
-  posToIndex(md_.camera_pos_ - r, lo);
-  posToIndex(md_.camera_pos_ + r, hi);
-  boundIndex(lo);
-  boundIndex(hi);
-
-  std::vector<Frontier> raw;
-  for (int x = lo(0); x <= hi(0); ++x)
-    for (int y = lo(1); y <= hi(1); ++y)
-      for (int z = lo(2); z <= hi(2); ++z)
-      {
-        const Eigen::Vector3i cur(x, y, z);
-        if (md_.frontier_flag_[toAddress(cur)] == 0 && isFrontierCell(cur))
-          expandFrontier(cur, lo, hi, raw);
-      }
-
-  // reset only the touched flags (the buffer is as large as the whole map)
-  for (const int a : frontier_touched_)
-    md_.frontier_flag_[a] = 0;
-  frontier_touched_.clear();
-
-  for (const auto &f : raw)
-  {
-    std::vector<Frontier> splits;
-    if (splitHorizontally(f, splits, 0))
-      frontiers_.insert(frontiers_.end(), splits.begin(), splits.end());
-    else
-      frontiers_.push_back(f);
-  }
-  int id = 0;
-  for (auto &f : frontiers_)
-    f.id_ = id++;
-}
-
-void GridMap::publishFrontiers()
-{
-  if (!mp_.use_free_space_only_)
-    return;
-  if (frontier_cloud_pub_->get_subscription_count() <= 0 &&
-      frontier_marker_pub_->get_subscription_count() <= 0)
-    return;
-
-  searchFrontiers();
-  const rclcpp::Time stamp = node_->now();
-
-  auto color = [](int id, float &r, float &g, float &b) {
-    r = 0.3f + 0.7f * ((id * 37) % 100) / 100.f;
-    g = 0.3f + 0.7f * ((id * 71) % 100) / 100.f;
-    b = 0.3f + 0.7f * ((id * 13) % 100) / 100.f;
-  };
-
-  // colour-coded cell cloud (RViz2: Color Transformer = RGB8)
-  pcl::PointCloud<pcl::PointXYZRGB> cloud;
-  for (const auto &f : frontiers_)
-  {
-    float r, g, b;
-    color(f.id_, r, g, b);
-    for (const auto &c : f.cells_)
-    {
-      pcl::PointXYZRGB p;
-      p.x = c(0);
-      p.y = c(1);
-      p.z = c(2);
-      p.r = static_cast<uint8_t>(255 * r);
-      p.g = static_cast<uint8_t>(255 * g);
-      p.b = static_cast<uint8_t>(255 * b);
-      cloud.push_back(p);
-    }
-  }
-  cloud.width = cloud.points.size();
-  cloud.height = 1;
-  cloud.is_dense = true;
-  sensor_msgs::msg::PointCloud2 cloud_msg;
-  pcl::toROSMsg(cloud, cloud_msg);
-  cloud_msg.header.frame_id = mp_.frame_id_;
-  cloud_msg.header.stamp = stamp;
-  frontier_cloud_pub_->publish(cloud_msg);
-
-  // bounding box + average per cluster
-  visualization_msgs::msg::MarkerArray arr;
-  visualization_msgs::msg::Marker del;
-  del.header.frame_id = mp_.frame_id_;
-  del.header.stamp = stamp;
-  del.action = visualization_msgs::msg::Marker::DELETEALL;
-  arr.markers.push_back(del);
-
-  for (const auto &f : frontiers_)
-  {
-    float r, g, b;
-    color(f.id_, r, g, b);
-
-    visualization_msgs::msg::Marker box;
-    box.header.frame_id = mp_.frame_id_;
-    box.header.stamp = stamp;
-    box.ns = "frontier_box";
-    box.id = f.id_;
-    box.type = visualization_msgs::msg::Marker::CUBE;
-    box.action = visualization_msgs::msg::Marker::ADD;
-    const Eigen::Vector3d center = 0.5 * (f.box_min_ + f.box_max_);
-    const Eigen::Vector3d size = (f.box_max_ - f.box_min_).cwiseMax(Eigen::Vector3d::Constant(mp_.resolution_));
-    box.pose.position.x = center(0);
-    box.pose.position.y = center(1);
-    box.pose.position.z = center(2);
-    box.pose.orientation.w = 1.0;
-    box.scale.x = size(0);
-    box.scale.y = size(1);
-    box.scale.z = size(2);
-    box.color.r = r;
-    box.color.g = g;
-    box.color.b = b;
-    box.color.a = 0.3;
-    arr.markers.push_back(box);
-
-    visualization_msgs::msg::Marker avg = box;
-    avg.ns = "frontier_average";
-    avg.type = visualization_msgs::msg::Marker::SPHERE;
-    avg.pose.position.x = f.average_(0);
-    avg.pose.position.y = f.average_(1);
-    avg.pose.position.z = f.average_(2);
-    avg.scale.x = avg.scale.y = avg.scale.z = 0.3;
-    avg.color.a = 1.0;
-    arr.markers.push_back(avg);
-  }
-  frontier_marker_pub_->publish(arr);
 }
 
 bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
