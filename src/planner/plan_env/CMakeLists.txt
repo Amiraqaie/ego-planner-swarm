@@ -22,7 +22,6 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(message_filters REQUIRED)
-
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
@@ -89,11 +88,18 @@ target_link_libraries( plan_env
   ${OCTOMAP_LIBRARIES}
 )  
 
+add_executable(frontier_node src/frontier_node.cpp)
+
 add_executable(obj_generator
     src/obj_generator.cpp 
 )
 ament_target_dependencies(obj_generator std_msgs visualization_msgs geometry_msgs nav_msgs rclcpp Eigen3 PCL cv_bridge message_filters pcl_conversions)
-
+target_include_directories(frontier_node PUBLIC
+  ${OCTOMAP_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIR})
+target_link_libraries(frontier_node ${OCTOMAP_LIBRARIES})
+ament_target_dependencies(frontier_node
+  rclcpp nav_msgs geometry_msgs visualization_msgs octomap_msgs)
+  
 install(TARGETS plan_env
         DESTINATION lib
 )
@@ -101,7 +107,8 @@ install(TARGETS plan_env
 install(TARGETS obj_generator
         DESTINATION lib/${PROJECT_NAME}
 )
-
+install(TARGETS frontier_node
+  DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/${PROJECT_NAME}/
   DESTINATION include/${PROJECT_NAME}
 )
