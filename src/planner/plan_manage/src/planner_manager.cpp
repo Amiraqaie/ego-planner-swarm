@@ -6,6 +6,16 @@
 namespace ego_planner
 {
 
+  // The first three control points determine the initial state of a uniform cubic spline.
+  static void matchSplineStart(Eigen::MatrixXd &points, double dt, const Eigen::Vector3d &position,
+                               const Eigen::Vector3d &velocity, const Eigen::Vector3d &acceleration)
+  {
+    const Eigen::Vector3d offset = acceleration * (dt * dt / 2.0);
+    points.col(0) = position - velocity * dt + 2.0 * offset / 3.0;
+    points.col(1) = position - offset / 3.0;
+    points.col(2) = position + velocity * dt + 2.0 * offset / 3.0;
+  }
+
   EGOPlannerManager::EGOPlannerManager() {}
 
   EGOPlannerManager::~EGOPlannerManager() {}
@@ -47,7 +57,8 @@ namespace ego_planner
 
   bool EGOPlannerManager::reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
-                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
+                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj,
+                                        const rclcpp::Time *handoff_time)
   {
     static int count = 0;
     printf("\033[47;30m\n[drone %d replan %d]==============================================\033[0m\n", pp_.drone_id, count++);
@@ -220,6 +231,9 @@ namespace ego_planner
     Eigen::MatrixXd ctrl_pts, ctrl_pts_temp;
     UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
 
+    if (handoff_time)
+      matchSplineStart(ctrl_pts, ts, start_pt, start_vel, start_acc);
+
     vector<std::pair<int, int>> segments;
     segments = bspline_optimizer_->initControlPoints(ctrl_pts, true);
     // 计算时间差并更新时间
@@ -304,7 +318,8 @@ namespace ego_planner
         cout << "Need to reallocate time." << endl;
 
         Eigen::MatrixXd optimal_control_points;
-        flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points);
+        flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points,
+                                         handoff_time ? &start_pt : nullptr);
         if (flag_step_2_success)
           pos = UniformBspline(optimal_control_points, 3, ts);
       }
@@ -330,7 +345,10 @@ namespace ego_planner
     t_refine = rclcpp::Clock().now() - t_start;
 
     // save planned results
-    updateTrajInfo(pos, rclcpp::Clock().now());
+    now = rclcpp::Clock().now();
+    if (handoff_time && now >= *handoff_time)
+      return false;
+    updateTrajInfo(pos, handoff_time ? *handoff_time : now);
 
     static double sum_time = 0;
     static int count_success = 0;
@@ -527,7 +545,8 @@ namespace ego_planner
     return true;
   }
 
-  bool EGOPlannerManager::refineTrajAlgo(UniformBspline &traj, vector<Eigen::Vector3d> &start_end_derivative, double ratio, double &ts, Eigen::MatrixXd &optimal_control_points)
+  bool EGOPlannerManager::refineTrajAlgo(UniformBspline &traj, vector<Eigen::Vector3d> &start_end_derivative, double ratio, double &ts, Eigen::MatrixXd &optimal_control_points,
+                                        const Eigen::Vector3d *handoff_position)
   {
     double t_inc;
 
@@ -535,6 +554,9 @@ namespace ego_planner
 
     // std::cout << "ratio: " << ratio << std::endl;
     reparamBspline(traj, start_end_derivative, ratio, ctrl_pts, ts, t_inc);
+
+    if (handoff_position)
+      matchSplineStart(ctrl_pts, ts, *handoff_position, start_end_derivative[0], start_end_derivative[2]);
 
     traj = UniformBspline(ctrl_pts, 3, ts);
 

@@ -14,7 +14,6 @@ bool reset_on_next_traj_ = true;               // true so the first trajectory a
 int64_t min_valid_traj_id_ = 0;
 int64_t goal_reference_traj_id_ = -1;
 int64_t canceled_goal_reference_traj_id_ = -1;
-ego_planner::Px4Offboard px4_offboard_;
 rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub;
 
 quadrotor_msgs::msg::PositionCommand cmd;
@@ -24,6 +23,7 @@ double vel_gain[3] = {0, 0, 0};
 using ego_planner::UniformBspline;
 
 bool receive_traj_ = false;
+traj_utils::msg::Bspline::ConstSharedPtr pending_traj_;
 vector<UniformBspline> traj_;
 double traj_duration_;
 rclcpp::Time start_time_;
@@ -44,6 +44,7 @@ void clearTrajectory()
 {
   receive_traj_ = false;
   traj_.clear();
+  pending_traj_.reset();
   reset_on_next_traj_ = true;
 }
 
@@ -53,34 +54,50 @@ void cancelOffboardGoal()
   clearTrajectory();
 }
 
-void newGoalCallback(std_msgs::msg::Int32::ConstSharedPtr msg)
+void newGoalCallback(std_msgs::msg::Int32::ConstSharedPtr msg, ego_planner::Px4Offboard &offboard)
 {
-  px4_offboard_.poll();
+  offboard.poll();
   if (msg->data < min_valid_traj_id_ || msg->data < traj_id_)
     return;
 
-  clearTrajectory();
+  if (!offboard.ready() || reset_on_next_traj_)
+    clearTrajectory();
   min_valid_traj_id_ = static_cast<int64_t>(msg->data) + 1;
   goal_reference_traj_id_ = msg->data;
 }
 
-void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
-{
+void activateSpline(const traj_utils::msg::Bspline::ConstSharedPtr &msg);
 
-  px4_offboard_.poll();
-  if (msg->traj_id < min_valid_traj_id_ || msg->traj_id <= traj_id_)
+void bsplineCallback(traj_utils::msg::Bspline::ConstSharedPtr msg, ego_planner::Px4Offboard &offboard)
+{
+  offboard.poll();
+  if (msg->traj_id < min_valid_traj_id_ || msg->traj_id <= traj_id_ ||
+      (pending_traj_ && msg->traj_id <= pending_traj_->traj_id))
     return;
-  if (px4_offboard_.enabled())
+  if (offboard.enabled())
   {
     if (msg->goal_reference_traj_id <= canceled_goal_reference_traj_id_ ||
         msg->goal_reference_traj_id < goal_reference_traj_id_)
       return;
 
-    if (msg->goal_reference_traj_id > goal_reference_traj_id_)
+    if (msg->goal_reference_traj_id > goal_reference_traj_id_ &&
+        (!offboard.ready() || reset_on_next_traj_))
       clearTrajectory();
     goal_reference_traj_id_ = msg->goal_reference_traj_id;
   }
 
+  if (rclcpp::Time(msg->start_time, RCL_SYSTEM_TIME) > rclcpp::Clock().now())
+  {
+    pending_traj_ = std::move(msg);
+    return;
+  }
+
+  pending_traj_.reset();
+  activateSpline(msg);
+}
+
+void activateSpline(const traj_utils::msg::Bspline::ConstSharedPtr &msg)
+{
   // parse pos traj
 
   Eigen::MatrixXd pos_pts(3, msg->pos_pts.size());
@@ -215,14 +232,21 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
   return yaw_yawdot;
 }
 
-void cmdCallback()
+void cmdCallback(ego_planner::Px4Offboard &offboard)
 {
-  px4_offboard_.poll();
-  if (!receive_traj_ || !px4_offboard_.ready())
+  offboard.poll();
+  if (!offboard.ready())
     return;
 
   rclcpp::Time time_now = rclcpp::Clock().now();
-  start_time_ = px4_offboard_.executionStart(start_time_);
+  if (pending_traj_ && time_now >= rclcpp::Time(pending_traj_->start_time, RCL_SYSTEM_TIME))
+  {
+    activateSpline(pending_traj_);
+    pending_traj_.reset();
+  }
+  if (!receive_traj_)
+    return;
+  start_time_ = offboard.executionStart(start_time_);
   double t_cur = (time_now - start_time_).seconds();
   if (t_cur < 0.0)
     return;
@@ -296,23 +320,25 @@ int main(int argc, char **argv)
 {
   rclcpp::init(argc, argv);
   auto node = rclcpp::Node::make_shared("traj_server");
-  px4_offboard_.init(*node, cancelOffboardGoal);
+  ego_planner::Px4Offboard offboard;
+  offboard.init(*node, cancelOffboardGoal);
 
   auto bspline_sub = node->create_subscription<traj_utils::msg::Bspline>(
       "planning/bspline",
       10,
-      bsplineCallback);
+      [&offboard](traj_utils::msg::Bspline::ConstSharedPtr msg) { bsplineCallback(std::move(msg), offboard); });
   auto odom_sub = node->create_subscription<nav_msgs::msg::Odometry>(
       "odom_world", 10, odomCallback);
   auto goal_sub = node->create_subscription<std_msgs::msg::Int32>(
-      "/ego/new_goal", 10, newGoalCallback);
+      "/ego/new_goal", 10,
+      [&offboard](std_msgs::msg::Int32::ConstSharedPtr msg) { newGoalCallback(std::move(msg), offboard); });
   pos_cmd_pub = node->create_publisher<quadrotor_msgs::msg::PositionCommand>(
       "/position_cmd",
       50);
 
   auto cmd_timer = node->create_wall_timer(
       std::chrono::milliseconds(10),
-      cmdCallback);
+      [&offboard]() { cmdCallback(offboard); });
 
   /* control parameter */
   cmd.kx[0] = pos_gain[0];
@@ -334,6 +360,7 @@ int main(int argc, char **argv)
   RCLCPP_WARN(node->get_logger(), "[Traj server]: ready.");
 
   rclcpp::spin(node);
+  pos_cmd_pub.reset();
   rclcpp::shutdown();
 
   return 0;

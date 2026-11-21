@@ -26,6 +26,9 @@ namespace ego_planner
     node_->get_parameter("fsm/default_goal_height", default_goal_height_);
     node_->declare_parameter("fsm/goal_topic", std::string("/move_base_simple/goal"));
     node_->declare_parameter("fsm/goal_z_valid_min", 0.1);
+    goal_handoff_time_ = node_->declare_parameter("fsm/goal_handoff_time", 0.25);
+    if (!std::isfinite(goal_handoff_time_) || goal_handoff_time_ <= 0.0)
+      throw std::invalid_argument("fsm/goal_handoff_time must be finite and positive");
     node_->declare_parameter("fsm/use_astar_global", false);
     std::string goal_topic;
 
@@ -196,6 +199,9 @@ namespace ego_planner
 
   void EGOReplanFSM::planNextWaypoint(const Eigen::Vector3d next_wp, bool restart)
   {
+    const bool smooth_replacement = restart && px4_offboard_.ready() && !pending_swarm_publish_ &&
+                                    (exec_state_ == EXEC_TRAJ || exec_state_ == REPLAN_TRAJ) &&
+                                    planner_manager_->local_data_.start_time_.nanoseconds() > 0;
     bool success = planGlobalRoute(next_wp);
 
     if (success)
@@ -232,8 +238,15 @@ namespace ego_planner
         }
       }
 
-      if (restart)
+      if (smooth_replacement)
       {
+        smooth_goal_replan_ = true;
+        changeFSMExecState(REPLAN_TRAJ, "NEW_GOAL");
+      }
+      else if (restart)
+      {
+        smooth_goal_replan_ = false;
+        outgoing_traj_.reset();
         pending_swarm_publish_.reset();
         // A zero start time disables collision checks against the old trajectory.
         planner_manager_->local_data_.start_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
@@ -306,6 +319,12 @@ namespace ego_planner
 
     Eigen::Vector3d end_wp(gx, gy, goal_z);
 
+    px4_offboard_.poll();
+    constexpr double goal_tolerance = 0.01;
+    if (have_target_ && (end_pt_.head<2>() - end_wp.head<2>()).norm() < goal_tolerance &&
+        (!z_given || std::abs(end_pt_.z() - goal_z) < goal_tolerance))
+      return;
+
     // reboundReplan() rejects start/target closer than 0.2 m and would retry forever.
     if ((end_wp - odom_pos_).norm() < 0.25)
     {
@@ -317,9 +336,8 @@ namespace ego_planner
                 "New goal (%.2f, %.2f, %.2f) [z %s]", gx, gy, goal_z,
                 z_given ? "from goal" : "= current UAV height");
 
-    px4_offboard_.poll();
     init_pt_ = odom_pos_;
-    planNextWaypoint(end_wp, true);   // true = hard restart
+    planNextWaypoint(end_wp, true);
   }
 
   void EGOReplanFSM::odometryCallback(const std::shared_ptr<const nav_msgs::msg::Odometry> &msg)
@@ -422,7 +440,8 @@ namespace ego_planner
     planner_manager_->swarm_trajs_buf_[id].start_time_ = msg->start_time;
 
     /* Check Collision */
-    if (px4_offboard_.ready() && !pending_swarm_publish_ && planner_manager_->checkCollision(id))
+    if (px4_offboard_.ready() && !pending_swarm_publish_ && !outgoing_traj_ &&
+        planner_manager_->checkCollision(id))
     {
       changeFSMExecState(REPLAN_TRAJ, "TRAJ_CHECK");
     }
@@ -542,6 +561,8 @@ namespace ego_planner
     have_target_ = false;
     have_new_target_ = false;
     have_trigger_ = false;
+    smooth_goal_replan_ = false;
+    outgoing_traj_.reset();
     pending_swarm_publish_.reset();
     planner_manager_->local_data_.start_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
     if (exec_state_ != INIT)
@@ -552,6 +573,8 @@ namespace ego_planner
   {
     exec_timer_->cancel(); // To avoid blockage
     px4_offboard_.poll();
+    if (outgoing_traj_ && rclcpp::Clock().now() >= planner_manager_->local_data_.start_time_)
+      outgoing_traj_.reset();
 
     static int fsm_num = 0;
     fsm_num++;
@@ -644,6 +667,8 @@ namespace ego_planner
 
     case REPLAN_TRAJ:
     {
+      if (outgoing_traj_)
+        break;
 
       if (planFromCurrentTraj(1))
       {
@@ -679,7 +704,7 @@ namespace ego_planner
 
     case EXEC_TRAJ:
     {
-      if (!px4_offboard_.ready())
+      if (!px4_offboard_.ready() || outgoing_traj_)
         break;
 
       auto &start = planner_manager_->local_data_.start_time_;
@@ -809,6 +834,28 @@ namespace ego_planner
     // ros::Time time_now = ros::Time::now();
     auto time_now = rclcpp::Clock().now();
     // double t_cur = (time_now - info->start_time_).toSec();
+    if (smooth_goal_replan_)
+    {
+      const auto handoff_time = time_now + rclcpp::Duration::from_seconds(goal_handoff_time_);
+      const double t = (handoff_time - info->start_time_).seconds();
+      start_pt_ = info->position_traj_.evaluateDeBoorT(t);
+      start_vel_.setZero();
+      start_acc_.setZero();
+      if (t < info->duration_)
+      {
+        start_vel_ = info->velocity_traj_.evaluateDeBoorT(t);
+        start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t);
+      }
+
+      LocalTrajData outgoing = *info;
+      if (!callReboundReplan(true, false, &handoff_time))
+        return false;
+
+      smooth_goal_replan_ = false;
+      outgoing_traj_ = std::move(outgoing);
+      return true;
+    }
+
     double t_cur = (time_now - info->start_time_).seconds();
 
     start_pt_ = info->position_traj_.evaluateDeBoorT(t_cur);
@@ -861,7 +908,12 @@ namespace ego_planner
     /* ---------- check trajectory ---------- */
     constexpr double time_step = 0.01;
     // double t_cur = (ros::Time::now() - info->start_time_).toSec();
-    double t_cur = (rclcpp::Clock().now() - info->start_time_).seconds();
+    const auto now = rclcpp::Clock().now();
+    const bool before_handoff = outgoing_traj_ && now < info->start_time_;
+    const auto handoff_time = info->start_time_;
+    if (before_handoff)
+      info = &*outgoing_traj_;
+    double t_cur = (now - info->start_time_).seconds();
 
     Eigen::Vector3d p_cur = info->position_traj_.evaluateDeBoorT(t_cur);
     const double CLEARANCE = 1.0 * planner_manager_->getSwarmClearance();
@@ -869,7 +921,10 @@ namespace ego_planner
     double t_cur_global = rclcpp::Clock().now().seconds();
 
     double t_2_3 = info->duration_ * 2 / 3;
-    for (double t = t_cur; t < info->duration_; t += time_step)
+    const double check_until = before_handoff
+                                  ? std::min(info->duration_, (handoff_time - info->start_time_).seconds())
+                                  : info->duration_;
+    for (double t = t_cur; t < check_until; t += time_step)
     {
       if (t_cur < t_2_3 && t >= t_2_3) // If t_cur < t_2_3, only the first 2/3 partition of the trajectory is considered valid and will get checked.
         break;
@@ -898,6 +953,11 @@ namespace ego_planner
       if (occ)
       {
 
+        if (before_handoff)
+        {
+          changeFSMExecState(EMERGENCY_STOP, "SAFETY");
+          return;
+        }
         if (planFromCurrentTraj()) // Make a chance
         {
           changeFSMExecState(EXEC_TRAJ, "SAFETY");
@@ -924,13 +984,14 @@ namespace ego_planner
     }
   }
 
-  bool EGOReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
+  bool EGOReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj,
+                                       const rclcpp::Time *handoff_time)
   {
 
     getLocalTarget();
 
     bool plan_and_refine_success =
-        planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj);
+        planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj, handoff_time);
     have_new_target_ = false;
 
     cout << "refine_success=" << plan_and_refine_success << endl;
@@ -1092,6 +1153,8 @@ namespace ego_planner
   bool EGOReplanFSM::callEmergencyStop(Eigen::Vector3d stop_pos)
   {
 
+    outgoing_traj_.reset();
+    smooth_goal_replan_ = false;
     planner_manager_->EmergencyStop(stop_pos);
 
     auto info = &planner_manager_->local_data_;
