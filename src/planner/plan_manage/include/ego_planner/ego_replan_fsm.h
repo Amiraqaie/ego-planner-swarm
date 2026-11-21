@@ -1,6 +1,8 @@
 #ifndef _REBO_REPLAN_FSM_H_
 #define _REBO_REPLAN_FSM_H_
 
+#include <optional>
+#include "ego_planner/px4_offboard.h"
 #include <Eigen/Eigen>
 #include <algorithm>
 #include <iostream>
@@ -82,6 +84,11 @@ namespace ego_planner
     int current_wp_;
 
     bool flag_escape_emergency_;
+    Px4Offboard px4_offboard_;
+    int64_t goal_reference_traj_id_ = 0;
+    std::optional<bool> pending_swarm_publish_;
+
+    void cancelOffboardGoal();
 
     /* ROS utils */
     rclcpp::Node::SharedPtr node_;

@@ -67,6 +67,8 @@ namespace ego_planner
     planner_manager_->deliverTrajToOptimizer(); // store trajectories
     planner_manager_->setDroneIdtoOpt();
 
+    px4_offboard_.init(*node_, [this]() { cancelOffboardGoal(); });
+
     /* callback*/
     exec_timer_ = node_->create_wall_timer(std::chrono::milliseconds(10),
                                            std::bind(&EGOReplanFSM::execFSMCallback, this));
@@ -212,22 +214,32 @@ namespace ego_planner
       have_target_ = true;
       have_new_target_ = true;   // forces polynomial init in reboundReplan
 
+      // Internal preset waypoint advances share the original goal identity.
+      const bool new_goal = restart || exec_state_ == WAIT_TARGET || exec_state_ == INIT;
+      if (new_goal)
+      {
+        auto &last_traj_id = planner_manager_->local_data_.traj_id_;
+        // Reserve a unique reference even when this goal never produces a spline.
+        if (px4_offboard_.enabled())
+          ++last_traj_id;
+        goal_reference_traj_id_ = last_traj_id;
+
+        if (restart || px4_offboard_.enabled())
+        {
+          std_msgs::msg::Int32 goal_notice;
+          goal_notice.data = goal_reference_traj_id_;
+          new_goal_pub_->publish(goal_notice);
+        }
+      }
+
       if (restart)
       {
-        // 1. Forget the running local trajectory. A zero start_time_ makes
-        //    checkCollisionCallback() return early, so nothing replans the old one.
-        //    RCL_SYSTEM_TIME matches the clock used elsewhere in the FSM.
+        pending_swarm_publish_.reset();
+        // A zero start time disables collision checks against the old trajectory.
         planner_manager_->local_data_.start_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
         flag_escape_emergency_ = true;
 
-        // 2. Tell traj_server to drop the old trajectory. The payload is the last
-        //    traj_id, so traj_server can ignore any older B-spline still in flight.
-        //    Only sent after global planning succeeded.
-        std_msgs::msg::Int32 ng;
-        ng.data = planner_manager_->local_data_.traj_id_;
-        new_goal_pub_->publish(ng);
-
-        // 3. GEN_NEW_TRAJ plans from odom_pos_/odom_vel_, not from the old B-spline.
+        // GEN_NEW_TRAJ plans from the latest odometry.
         changeFSMExecState(GEN_NEW_TRAJ, "NEW_GOAL");
       }
       else if (exec_state_ == WAIT_TARGET)
@@ -254,7 +266,13 @@ namespace ego_planner
   
   void EGOReplanFSM::triggerCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
   {
+    px4_offboard_.poll();
     have_trigger_ = true;
+    if (px4_offboard_.enabled() && exec_state_ == WAIT_TARGET && !have_target_ && !wps_.empty())
+    {
+      wp_id_ = 0;
+      planNextWaypoint(wps_[wp_id_]);
+    }
     cout << "Triggered!" << endl;
     init_pt_ = odom_pos_;
   }
@@ -299,6 +317,7 @@ namespace ego_planner
                 "New goal (%.2f, %.2f, %.2f) [z %s]", gx, gy, goal_z,
                 z_given ? "from goal" : "= current UAV height");
 
+    px4_offboard_.poll();
     init_pt_ = odom_pos_;
     planNextWaypoint(end_wp, true);   // true = hard restart
   }
@@ -403,7 +422,7 @@ namespace ego_planner
     planner_manager_->swarm_trajs_buf_[id].start_time_ = msg->start_time;
 
     /* Check Collision */
-    if (planner_manager_->checkCollision(id))
+    if (px4_offboard_.ready() && !pending_swarm_publish_ && planner_manager_->checkCollision(id))
     {
       changeFSMExecState(REPLAN_TRAJ, "TRAJ_CHECK");
     }
@@ -518,9 +537,21 @@ namespace ego_planner
     cout << "[FSM]: state: " + state_str[int(exec_state_)] << endl;
   }
 
+  void EGOReplanFSM::cancelOffboardGoal()
+  {
+    have_target_ = false;
+    have_new_target_ = false;
+    have_trigger_ = false;
+    pending_swarm_publish_.reset();
+    planner_manager_->local_data_.start_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
+    if (exec_state_ != INIT)
+      changeFSMExecState(WAIT_TARGET, "OFFBOARD_LOST");
+  }
+
   void EGOReplanFSM::execFSMCallback()
   {
     exec_timer_->cancel(); // To avoid blockage
+    px4_offboard_.poll();
 
     static int fsm_num = 0;
     fsm_num++;
@@ -648,6 +679,17 @@ namespace ego_planner
 
     case EXEC_TRAJ:
     {
+      if (!px4_offboard_.ready())
+        break;
+
+      auto &start = planner_manager_->local_data_.start_time_;
+      start = px4_offboard_.executionStart(start);
+      if (pending_swarm_publish_)
+      {
+        publishSwarmTrajs(*pending_swarm_publish_);
+        pending_swarm_publish_.reset();
+      }
+
       static int blk_cnt = 0;
       if (use_astar_global_ && planner_manager_->grid_map_->useFreeSpaceOnly() && ++blk_cnt >= 50)
       {
@@ -802,7 +844,9 @@ namespace ego_planner
     LocalTrajData *info = &planner_manager_->local_data_;
     auto map = planner_manager_->grid_map_;
     
-    if (exec_state_ == WAIT_TARGET || info->start_time_.seconds() < 1e-5)
+    px4_offboard_.poll();
+    if (!px4_offboard_.ready() || pending_swarm_publish_ ||
+        exec_state_ == WAIT_TARGET || info->start_time_.seconds() < 1e-5)
       return;
 
     /* ---------- check lost of depth ---------- */
@@ -900,6 +944,7 @@ namespace ego_planner
       bspline.order = 3;
       bspline.start_time = info->start_time_;
       bspline.traj_id = info->traj_id_;
+      bspline.goal_reference_traj_id = goal_reference_traj_id_;
 
       Eigen::MatrixXd pos_pts = info->position_traj_.getControlPoint();
       bspline.pos_pts.reserve(pos_pts.cols());
@@ -934,6 +979,12 @@ namespace ego_planner
 
   void EGOReplanFSM::publishSwarmTrajs(bool startup_pub)
   {
+    if (!px4_offboard_.ready())
+    {
+      pending_swarm_publish_ = startup_pub;
+      return;
+    }
+
     auto info = &planner_manager_->local_data_;
 
     traj_utils::msg::Bspline bspline;
@@ -941,6 +992,7 @@ namespace ego_planner
     bspline.start_time = info->start_time_;
     bspline.drone_id = planner_manager_->pp_.drone_id;
     bspline.traj_id = info->traj_id_;
+    bspline.goal_reference_traj_id = goal_reference_traj_id_;
 
     Eigen::MatrixXd pos_pts = info->position_traj_.getControlPoint();
     bspline.pos_pts.reserve(pos_pts.cols());
@@ -1049,6 +1101,7 @@ namespace ego_planner
     bspline.order = 3;
     bspline.start_time = info->start_time_;
     bspline.traj_id = info->traj_id_;
+    bspline.goal_reference_traj_id = goal_reference_traj_id_;
 
     Eigen::MatrixXd pos_pts = info->position_traj_.getControlPoint();
     bspline.pos_pts.reserve(pos_pts.cols());

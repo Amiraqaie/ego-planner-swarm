@@ -14,6 +14,7 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(px4_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(quadrotor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
@@ -59,7 +60,7 @@ add_executable(ego_planner_node
 # )
 
 ament_target_dependencies(ego_planner_node 
-                          std_msgs
+                          std_msgs px4_msgs
                           rclcpp nav_msgs visualization_msgs 
                           geometry_msgs quadrotor_msgs 
                           plan_env path_searching 
@@ -78,7 +79,7 @@ target_link_libraries(ego_planner_node
 add_executable(traj_server src/traj_server.cpp)
 
 ament_target_dependencies(traj_server 
-                          std_msgs
+                          std_msgs px4_msgs
                           rclcpp nav_msgs 
                           visualization_msgs geometry_msgs 
                           quadrotor_msgs plan_env 

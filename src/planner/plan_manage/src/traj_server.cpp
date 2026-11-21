@@ -6,11 +6,15 @@
 #include "visualization_msgs/msg/marker.hpp"
 #include <rclcpp/rclcpp.hpp>
 #include "std_msgs/msg/int32.hpp"
+#include "ego_planner/px4_offboard.h"
 
-rclcpp::Time time_last_(0, 0, RCL_ROS_TIME);   // replaces the static in cmdCallback
+rclcpp::Time time_last_(0, 0, RCL_SYSTEM_TIME);
 double odom_yaw_ = 0.0;
 bool reset_on_next_traj_ = true;               // true so the first trajectory also starts clean
-int min_valid_traj_id_ = -1;
+int64_t min_valid_traj_id_ = 0;
+int64_t goal_reference_traj_id_ = -1;
+int64_t canceled_goal_reference_traj_id_ = -1;
+ego_planner::Px4Offboard px4_offboard_;
 rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub;
 
 quadrotor_msgs::msg::PositionCommand cmd;
@@ -23,7 +27,7 @@ bool receive_traj_ = false;
 vector<UniformBspline> traj_;
 double traj_duration_;
 rclcpp::Time start_time_;
-int traj_id_;
+int64_t traj_id_ = -1;
 
 // yaw control
 double last_yaw_, last_yaw_dot_;
@@ -36,18 +40,46 @@ void odomCallback(nav_msgs::msg::Odometry::ConstSharedPtr msg)
                     1.0 - 2.0 * (q.y * q.y + q.z * q.z));
 }
 
+void clearTrajectory()
+{
+  receive_traj_ = false;
+  traj_.clear();
+  reset_on_next_traj_ = true;
+}
+
+void cancelOffboardGoal()
+{
+  canceled_goal_reference_traj_id_ = goal_reference_traj_id_;
+  clearTrajectory();
+}
+
 void newGoalCallback(std_msgs::msg::Int32::ConstSharedPtr msg)
 {
-  receive_traj_ = false;                    // stop publishing the old trajectory now
-  reset_on_next_traj_ = true;               // reset yaw state on the next accepted spline
-  min_valid_traj_id_ = msg->data + 1;       // ignore anything planned before this goal
+  px4_offboard_.poll();
+  if (msg->data < min_valid_traj_id_ || msg->data < traj_id_)
+    return;
+
+  clearTrajectory();
+  min_valid_traj_id_ = static_cast<int64_t>(msg->data) + 1;
+  goal_reference_traj_id_ = msg->data;
 }
 
 void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 {
 
-  if (msg->traj_id < min_valid_traj_id_)
-    return;   // stale B-spline from the previous goal
+  px4_offboard_.poll();
+  if (msg->traj_id < min_valid_traj_id_ || msg->traj_id <= traj_id_)
+    return;
+  if (px4_offboard_.enabled())
+  {
+    if (msg->goal_reference_traj_id <= canceled_goal_reference_traj_id_ ||
+        msg->goal_reference_traj_id < goal_reference_traj_id_)
+      return;
+
+    if (msg->goal_reference_traj_id > goal_reference_traj_id_)
+      clearTrajectory();
+    goal_reference_traj_id_ = msg->goal_reference_traj_id;
+  }
 
   // parse pos traj
 
@@ -78,7 +110,7 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 
   // UniformBspline yaw_traj(yaw_pts, msg->order, msg->yaw_dt);
 
-  start_time_ = msg->start_time;
+  start_time_ = rclcpp::Time(msg->start_time, RCL_SYSTEM_TIME);
   traj_id_ = msg->traj_id;
 
   traj_.clear();
@@ -87,15 +119,6 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
   traj_.push_back(traj_[1].getDerivative());
 
   traj_duration_ = traj_[0].getTimeSum();
-
-  if (reset_on_next_traj_)
-  {
-    last_yaw_ = odom_yaw_;      // start from the actual heading
-    last_yaw_dot_ = 0.0;
-    time_last_ = rclcpp::Clock(RCL_ROS_TIME).now();
-    reset_on_next_traj_ = false;
-    min_valid_traj_id_ = -1;
-  }
 
   receive_traj_ = true;
 }
@@ -194,33 +217,43 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
 
 void cmdCallback()
 {
-  /* no publishing before receive traj_ */
-  if (!receive_traj_)
+  px4_offboard_.poll();
+  if (!receive_traj_ || !px4_offboard_.ready())
     return;
 
-  // 统一时间源
-  rclcpp::Clock clock(RCL_ROS_TIME);  
-  rclcpp::Time time_now = clock.now();
+  rclcpp::Time time_now = rclcpp::Clock().now();
+  start_time_ = px4_offboard_.executionStart(start_time_);
   double t_cur = (time_now - start_time_).seconds();
+  if (t_cur < 0.0)
+    return;
+
+  const bool first_command = reset_on_next_traj_;
+  if (first_command)
+  {
+    last_yaw_ = odom_yaw_;
+    last_yaw_dot_ = 0.0;
+    reset_on_next_traj_ = false;
+  }
 
   Eigen::Vector3d pos(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero()), pos_f;
   std::pair<double, double> yaw_yawdot(0, 0);
 
   // static rclcpp::Time time_last = clock.now();
-  if (t_cur < traj_duration_ && t_cur >= 0.0)
+  if (t_cur < traj_duration_)
   {
     pos = traj_[0].evaluateDeBoorT(t_cur);
     vel = traj_[1].evaluateDeBoorT(t_cur);
     acc = traj_[2].evaluateDeBoorT(t_cur);
 
     /*** calculate yaw ***/
-    yaw_yawdot = calculate_yaw(t_cur, pos, time_now, time_last_);
+    yaw_yawdot = first_command ? std::make_pair(last_yaw_, 0.0)
+                               : calculate_yaw(t_cur, pos, time_now, time_last_);
     /*** calculate yaw ***/
 
     double tf = min(traj_duration_, t_cur + 2.0);
     pos_f = traj_[0].evaluateDeBoorT(tf);
   }
-  else if (t_cur >= traj_duration_)
+  else
   {
     /* hover when finish traj_ */
     pos = traj_[0].evaluateDeBoorT(traj_duration_);
@@ -231,10 +264,6 @@ void cmdCallback()
     yaw_yawdot.second = 0;
 
     pos_f = pos;
-  }
-  else
-  {
-    cout << "[Traj server]: invalid time." << endl;
   }
   time_last_ = time_now;
 
@@ -267,6 +296,7 @@ int main(int argc, char **argv)
 {
   rclcpp::init(argc, argv);
   auto node = rclcpp::Node::make_shared("traj_server");
+  px4_offboard_.init(*node, cancelOffboardGoal);
 
   auto bspline_sub = node->create_subscription<traj_utils::msg::Bspline>(
       "planning/bspline",
