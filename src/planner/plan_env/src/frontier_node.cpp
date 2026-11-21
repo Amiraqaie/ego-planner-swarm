@@ -21,7 +21,7 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <octomap/octomap.h>
 #include <octomap_msgs/msg/octomap.hpp>
-#include <octomap_msgs/conversions.h>
+#include "plan_env/full_octomap.h"
 #include <Eigen/Eigen>
 
 #include <algorithm>
@@ -299,14 +299,15 @@ private:
   }
 
   // Octomap obstacles: rebuild grid from occupied leaves around the drone (octomap can un-occupy cells).
-  void rebuildFromOctomap(const Vec3 & pos, bool has_odom)
+  template <typename Tree>
+  void rebuildFromOctomap(const Tree &tree, const Vec3 & pos, bool has_odom)
   {
     grid_.clear();
     const int dims[3] = {grid_.nx, grid_.ny, grid_.nz};
     const double org[3] = {grid_.origin.x(), grid_.origin.y(), grid_.origin.z()};
 
     auto addLeaf = [&](const auto & it) {
-      if (!tree_->isNodeOccupied(*it)) return;
+      if (!tree.isNodeOccupied(*it)) return;
       const double h = it.getSize() * 0.5;
       const octomap::point3d c = it.getCoordinate();
       int lo[3], hi[3];
@@ -328,10 +329,10 @@ private:
       const double m = iterate_range_ + inflation_radius_ + 2 * res_;
       const octomap::point3d bmin(pos.x() - m, pos.y() - m, pos.z() - m);
       const octomap::point3d bmax(pos.x() + m, pos.y() + m, pos.z() + m);
-      for (auto it = tree_->begin_leafs_bbx(bmin, bmax), end = tree_->end_leafs_bbx(); it != end; ++it)
+      for (auto it = tree.begin_leafs_bbx(bmin, bmax), end = tree.end_leafs_bbx(); it != end; ++it)
         addLeaf(it);
     } else {
-      for (auto it = tree_->begin_leafs(), end = tree_->end_leafs(); it != end; ++it) addLeaf(it);
+      for (auto it = tree.begin_leafs(), end = tree.end_leafs(); it != end; ++it) addLeaf(it);
     }
   }
 
@@ -352,16 +353,20 @@ private:
 
     const auto t0 = std::chrono::steady_clock::now();
 
-    std::unique_ptr<octomap::AbstractOcTree> abs(octomap_msgs::fullMsgToMap(*msg));
-    auto * t = dynamic_cast<octomap::OcTree *>(abs.get());
-    if (!t) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "need octomap_full holding an OcTree");
-      return;
+    if (!visitFullOctomap(*msg, [&](const auto &tree) {
+      processTree(tree, pos, has_odom, msg->header, t0);
+    })) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "expected a full OcTree or ColorOcTree, received %s (binary=%d)",
+                           msg->id.c_str(), msg->binary);
     }
-    abs.release();
-    tree_.reset(t);
-    res_ = tree_->getResolution();
+  }
 
+  template <typename Tree>
+  void processTree(const Tree &tree, const Vec3 &pos, bool has_odom,
+                   const std_msgs::msg::Header &header, std::chrono::steady_clock::time_point t0)
+  {
+    res_ = tree.getResolution();
     std::lock_guard<std::mutex> gl(grid_mtx_);  // grid is shared with the laser callback
 
     if (use_laser_) {
@@ -370,22 +375,22 @@ private:
         return;
       }
     } else {
-      rebuildFromOctomap(pos, has_odom);
+      rebuildFromOctomap(tree, pos, has_odom);
     }
 
     KeySet cells;
-    detectCells(pos, has_odom, cells);
+    detectCells(tree, pos, has_odom, cells);
 
-    std::vector<Frontier> raw = cluster(cells);
+    std::vector<Frontier> raw = cluster(tree, cells);
     std::vector<Frontier> frontiers;
     for (auto & f : raw) splitFrontier(f, frontiers, 0);
 
     if (has_odom)
-      for (auto & f : frontiers) sampleViewpoints(f);
+      for (auto & f : frontiers) sampleViewpoints(tree, f);
 
-    publish(frontiers, msg->header);
-    publishInflated(pos, has_odom, msg->header);
-    if (publish_goal_ && has_odom) selectGoal(frontiers, pos, msg->header);
+    publish(frontiers, header);
+    publishInflated(pos, has_odom, header);
+    if (publish_goal_ && has_odom) selectGoal(frontiers, pos, header);
 
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 3000,
@@ -400,21 +405,23 @@ private:
   }
 
   // unknown = no octomap node, not inside inflated obstacle space, inside the planner box
-  bool isUnknownAt(const Vec3 & p) const
+  template <typename Tree>
+  bool isUnknownAt(const Tree &tree, const Vec3 & p) const
   {
     int x, y, z;
     if (!grid_.toIdx(p, x, y, z)) return false;  // beyond the planner box there is nothing to explore
-    if (tree_->search(p.x(), p.y(), p.z()) != nullptr) return false;
+    if (tree.search(p.x(), p.y(), p.z()) != nullptr) return false;
     return grid_.inf[grid_.at(x, y, z)] == 0;
   }
 
   // ================================================================== detection
-  void detectCells(const Vec3 & pos, bool has_odom, KeySet & cells)
+  template <typename Tree>
+  void detectCells(const Tree &tree, const Vec3 & pos, bool has_odom, KeySet & cells)
   {
     static const int D[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
 
     auto handleLeaf = [&](const auto & it) {
-      if (tree_->isNodeOccupied(*it)) return;
+      if (tree.isNodeOccupied(*it)) return;
       const double size = it.getSize(), half = size * 0.5;
       const int n = std::max(1, static_cast<int>(std::lround(size / res_)));
       const octomap::point3d c = it.getCoordinate();
@@ -432,11 +439,11 @@ private:
             for (const auto & d : D) {
               const int a = i + d[0], b = j + d[1], e = k + d[2];
               if (a >= 0 && a < n && b >= 0 && b < n && e >= 0 && e < n) continue;
-              if (isUnknownAt(Vec3(x0 + (a + 0.5) * res_, y0 + (b + 0.5) * res_, z0 + (e + 0.5) * res_)))
+              if (isUnknownAt(tree, Vec3(x0 + (a + 0.5) * res_, y0 + (b + 0.5) * res_, z0 + (e + 0.5) * res_)))
                 ++unk;
             }
             if (unk < min_unknown_) continue;
-            cells.insert(tree_->coordToKey(p.x(), p.y(), p.z()));
+            cells.insert(tree.coordToKey(p.x(), p.y(), p.z()));
           }
         }
     };
@@ -444,15 +451,16 @@ private:
     if (has_odom) {
       const octomap::point3d bmin(pos.x() - iterate_range_, pos.y() - iterate_range_, pos.z() - iterate_range_);
       const octomap::point3d bmax(pos.x() + iterate_range_, pos.y() + iterate_range_, pos.z() + iterate_range_);
-      for (auto it = tree_->begin_leafs_bbx(bmin, bmax), end = tree_->end_leafs_bbx(); it != end; ++it)
+      for (auto it = tree.begin_leafs_bbx(bmin, bmax), end = tree.end_leafs_bbx(); it != end; ++it)
         handleLeaf(it);
     } else {
-      for (auto it = tree_->begin_leafs(), end = tree_->end_leafs(); it != end; ++it) handleLeaf(it);
+      for (auto it = tree.begin_leafs(), end = tree.end_leafs(); it != end; ++it) handleLeaf(it);
     }
   }
 
   // ================================================================== clustering
-  std::vector<Frontier> cluster(const KeySet & cells)
+  template <typename Tree>
+  std::vector<Frontier> cluster(const Tree &tree, const KeySet & cells)
   {
     KeySet visited;
     std::vector<Frontier> out;
@@ -465,7 +473,7 @@ private:
       while (!q.empty()) {
         const auto cur = q.front();
         q.pop();
-        const octomap::point3d p = tree_->keyToCoord(cur);
+        const octomap::point3d p = tree.keyToCoord(cur);
         f.cells.emplace_back(p.x(), p.y(), p.z());
         for (int dx = -1; dx <= 1; ++dx)
           for (int dy = -1; dy <= 1; ++dy)
@@ -549,12 +557,13 @@ private:
 
   // ================================================================== viewpoints
   // known free in octomap, outside inflated obstacles (O(1)), no unknown voxel nearby
-  bool safeSample(const Vec3 & s)
+  template <typename Tree>
+  bool safeSample(const Tree &tree, const Vec3 & s)
   {
     if (!inOutBox(s)) return false;
     if (grid_.infAt(s)) return false;
-    auto * n = tree_->search(s.x(), s.y(), s.z());
-    if (!n || tree_->isNodeOccupied(n)) return false;
+    auto * n = tree.search(s.x(), s.y(), s.z());
+    if (!n || tree.isNodeOccupied(n)) return false;
 
     const int vxy = std::max(1, static_cast<int>(std::ceil(unk_clear_xy_ / res_)));
     const int vz = std::max(1, static_cast<int>(std::ceil(unk_clear_z_ / res_)));
@@ -562,21 +571,23 @@ private:
     for (int dx = -vxy; dx <= vxy; dx += sxy)
       for (int dy = -vxy; dy <= vxy; dy += sxy)
         for (int dz = -vz; dz <= vz; dz += sz)
-          if (isUnknownAt(Vec3(s.x() + dx * res_, s.y() + dy * res_, s.z() + dz * res_))) return false;
+          if (isUnknownAt(tree, Vec3(s.x() + dx * res_, s.y() + dy * res_, s.z() + dz * res_))) return false;
     return true;
   }
 
   // a view ray is blocked by octomap-occupied, raw grid obstacle, or unknown space
-  bool keyBlocked(const octomap::OcTreeKey & key)
+  template <typename Tree>
+  bool keyBlocked(const Tree &tree, const octomap::OcTreeKey & key)
   {
-    auto * n = tree_->search(key);
-    if (n && tree_->isNodeOccupied(n)) return true;
-    const octomap::point3d c = tree_->keyToCoord(key);
+    auto * n = tree.search(key);
+    if (n && tree.isNodeOccupied(n)) return true;
+    const octomap::point3d c = tree.keyToCoord(key);
     if (grid_.occAt(Vec3(c.x(), c.y(), c.z()))) return true;
     return n == nullptr;
   }
 
-  int countVisible(const Vec3 & pos, double yaw, const std::vector<Vec3> & cells)
+  template <typename Tree>
+  int countVisible(const Tree &tree, const Vec3 & pos, double yaw, const std::vector<Vec3> & cells)
   {
     const double hh = 0.5 * hfov_, hv = 0.5 * vfov_;
     const int stride = std::max(1, static_cast<int>(cells.size()) / std::max(1, max_cells_eval_));
@@ -590,10 +601,10 @@ private:
       if (hfov_ < 6.2 && std::fabs(wrapAngle(std::atan2(d.y(), d.x()) - yaw)) > hh) continue;
       if (std::fabs(std::asin(d.z() / dist)) > hv) continue;
       const octomap::point3d e(cells[idx].x(), cells[idx].y(), cells[idx].z());
-      if (!tree_->computeRayKeys(o, e, ray)) continue;
+      if (!tree.computeRayKeys(o, e, ray)) continue;
       bool ok = true;
       for (auto it = ray.begin(); it != ray.end(); ++it)
-        if (keyBlocked(*it)) {
+        if (keyBlocked(tree, *it)) {
           ok = false;
           break;
         }
@@ -602,7 +613,8 @@ private:
     return vis * stride;
   }
 
-  void sampleViewpoints(Frontier & f)
+  template <typename Tree>
+  void sampleViewpoints(const Tree &tree, Frontier & f)
   {
     const int rnum = std::max(1, cand_rnum_);
     const double dr = (cand_rmax_ - cand_rmin_) / rnum;
@@ -611,9 +623,9 @@ private:
       for (double phi = -M_PI; phi < M_PI; phi += cand_dphi_) {
         Vec3 s = f.avg + rc * Vec3(std::cos(phi), std::sin(phi), 0.0);
         s.z() = std::max(s.z(), min_z_ + 0.3);
-        if (!safeSample(s)) continue;
+        if (!safeSample(tree, s)) continue;
         const double yaw = std::atan2(f.avg.y() - s.y(), f.avg.x() - s.x());
-        const int v = countVisible(s, yaw, f.filtered);
+        const int v = countVisible(tree, s, yaw, f.filtered);
         if (v >= min_visib_) f.viewpoints.push_back({s, yaw, v});
       }
     }
@@ -794,7 +806,6 @@ private:
   rclcpp::Time goal_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_laser_{0, 0, RCL_ROS_TIME};
 
-  std::unique_ptr<octomap::OcTree> tree_;
   ObstacleGrid grid_;
   bool laser_received_{false};
 
