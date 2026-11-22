@@ -3,6 +3,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from ament_index_python.packages import get_package_share_directory
@@ -149,7 +150,8 @@ def generate_launch_description():
             ('planning/bspline', ['drone_', drone_id, '_planning/bspline'])
         ],
         parameters=[
-            {'traj_server/time_forward': 1.0}
+            {'traj_server/time_forward': 1.0},
+            {'traj_server/max_yaw_rate': ParameterValue(LaunchConfiguration('max_yaw_rate'), value_type=float)}
         ]
     )
     
@@ -171,6 +173,8 @@ def generate_launch_description():
     
     ld = LaunchDescription()
         
+    ld.add_action(DeclareLaunchArgument('max_yaw_rate', default_value='0.5',
+                                        description='Maximum commanded yaw rate in rad/s'))
     ld.add_action(map_size_x_cmd)
     ld.add_action(map_size_y_cmd)
     ld.add_action(map_size_z_cmd)
