@@ -675,6 +675,14 @@ namespace ego_planner
         changeFSMExecState(EXEC_TRAJ, "FSM");
         publishSwarmTrajs(false);
       }
+      else if (smooth_goal_replan_)
+      {
+        // The server is still executing the previous goal until it receives a spline.
+        RCLCPP_WARN(node_->get_logger(), "Goal handoff failed, holding position and replanning from odometry.");
+        callEmergencyStop(odom_pos_);
+        publishSwarmTrajs(false);
+        changeFSMExecState(GEN_NEW_TRAJ, "NEW_GOAL");
+      }
       else
       {
         static rclcpp::Time last_route_time(0, 0, RCL_SYSTEM_TIME);
