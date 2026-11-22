@@ -1,5 +1,4 @@
 #include "plan_env/grid_map.h"
-#include "plan_env/full_octomap.h"
 
 // #define current_img_ md_.depth_image_[image_cnt_ & 1]
 // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
@@ -1087,15 +1086,15 @@ void GridMap::freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedP
   if (!mp_.use_free_space_only_)
     return;
 
-  if (!plan_env::visitFullOctomap(*msg, [this](const auto &tree) { importFreeLeaves(tree); }))
+  std::unique_ptr<octomap::AbstractOcTree> abstract(octomap_msgs::fullMsgToMap(*msg));
+  octomap::OcTree *tree = dynamic_cast<octomap::OcTree *>(abstract.get());
+  if (!tree)
+  {
     RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
-                         "free_octomap: expected a full OcTree or ColorOcTree, received %s (binary=%d)",
-                         msg->id.c_str(), msg->binary);
-}
+                         "free_octomap: need an octomap_full message holding an OcTree");
+    return;
+  }
 
-template <typename Tree>
-void GridMap::importFreeLeaves(const Tree &tree)
-{
   // the octomap is the whole truth: replace, do not accumulate
   std::fill(md_.free_buffer_.begin(), md_.free_buffer_.end(), 0);
 
@@ -1112,7 +1111,7 @@ void GridMap::importFreeLeaves(const Tree &tree)
                               md_.camera_pos_(2) + mp_.free_keep_range_);
 
   auto addLeaf = [&](const auto &it) {
-    if (tree.isNodeOccupied(*it))
+    if (tree->isNodeOccupied(*it))
       return;
     const double h = it.getSize() * 0.5;
     const octomap::point3d c = it.getCoordinate();
@@ -1139,12 +1138,12 @@ void GridMap::importFreeLeaves(const Tree &tree)
 
   if (crop)
   {
-    for (auto it = tree.begin_leafs_bbx(bmin, bmax), end = tree.end_leafs_bbx(); it != end; ++it)
+    for (auto it = tree->begin_leafs_bbx(bmin, bmax), end = tree->end_leafs_bbx(); it != end; ++it)
       addLeaf(it);
   }
   else
   {
-    for (auto it = tree.begin_leafs(), end = tree.end_leafs(); it != end; ++it)
+    for (auto it = tree->begin_leafs(), end = tree->end_leafs(); it != end; ++it)
       addLeaf(it);
   }
 

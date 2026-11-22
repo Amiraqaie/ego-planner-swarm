@@ -87,9 +87,6 @@ namespace ego_planner
     Px4Offboard px4_offboard_;
     int64_t goal_reference_traj_id_ = 0;
     std::optional<bool> pending_swarm_publish_;
-    std::optional<LocalTrajData> outgoing_traj_;
-    bool smooth_goal_replan_ = false;
-    double goal_handoff_time_;
 
     void cancelOffboardGoal();
 
@@ -111,8 +108,7 @@ namespace ego_planner
     rclcpp::Publisher<traj_utils::msg::Bspline>::SharedPtr broadcast_bspline_pub_;
 
     /* helper functions */
-    bool callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj,
-                           const rclcpp::Time *handoff_time = nullptr);
+    bool callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj); // front-end and back-end method
     bool callEmergencyStop(Eigen::Vector3d stop_pos);                          // front-end and back-end method
     bool planFromGlobalTraj(const int trial_times = 1);
     bool planFromCurrentTraj(const int trial_times = 1);

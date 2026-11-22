@@ -234,8 +234,6 @@ private:
 
   void freeCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void trimFreeBuffer();
-  template <typename Tree>
-  void importFreeLeaves(const Tree &tree);
   void freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedPtr msg);
   void forceFreeAroundOdom();
   void publishFreeSpace();
