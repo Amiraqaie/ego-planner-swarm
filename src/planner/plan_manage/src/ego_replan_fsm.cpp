@@ -25,6 +25,7 @@ namespace ego_planner
     node_->declare_parameter("fsm/default_goal_height", 1.0);
     node_->get_parameter("fsm/default_goal_height", default_goal_height_);
     node_->declare_parameter("fsm/goal_topic", std::string("/move_base_simple/goal"));
+    const auto goal_3d_topic = node_->declare_parameter<std::string>("fsm/goal_3d_topic", "/ego/goal_pose_3d");
     node_->declare_parameter("fsm/goal_z_valid_min", 0.1);
     node_->declare_parameter("fsm/use_astar_global", false);
     std::string goal_topic;
@@ -130,7 +131,18 @@ namespace ego_planner
           1,
           [this](const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
           {
-            this->waypointCallback(msg);
+            this->waypointCallback(msg, false);
+          });
+      waypoint_3d_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
+          goal_3d_topic, 1,
+          [this](const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
+          {
+            if (msg->header.frame_id != "map")
+            {
+              RCLCPP_WARN(node_->get_logger(), "3D goal ignored: expected the map frame.");
+              return;
+            }
+            this->waypointCallback(msg, true);
           });
     }
     else if (target_type_ == TARGET_TYPE::PRESET_TARGET)
@@ -277,7 +289,7 @@ namespace ego_planner
     init_pt_ = odom_pos_;
   }
 
-  void EGOReplanFSM::waypointCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg)
+  void EGOReplanFSM::waypointCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg, bool explicit_z)
   {
     if (!have_odom_)
     {
@@ -301,7 +313,7 @@ namespace ego_planner
                   msg->header.frame_id.c_str());
 
     // z rule: RViz 2D goal gives z = 0 -> keep the current UAV height.
-    const bool z_given = gz > goal_z_valid_min_;
+    const bool z_given = explicit_z || gz > goal_z_valid_min_;
     const double goal_z = z_given ? gz : odom_pos_(2);
 
     Eigen::Vector3d end_wp(gx, gy, goal_z);

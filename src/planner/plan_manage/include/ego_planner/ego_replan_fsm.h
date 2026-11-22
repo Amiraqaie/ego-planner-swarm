@@ -95,6 +95,7 @@ namespace ego_planner
     rclcpp::TimerBase::SharedPtr exec_timer_, safety_timer_;
 
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr waypoint_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr waypoint_3d_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<traj_utils::msg::MultiBsplines>::SharedPtr swarm_trajs_sub_;
     rclcpp::Subscription<traj_utils::msg::Bspline>::SharedPtr broadcast_bspline_sub_;
@@ -127,7 +128,7 @@ namespace ego_planner
     /* ROS functions */
     void execFSMCallback();
     void checkCollisionCallback();
-    void waypointCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg);
+    void waypointCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg, bool explicit_z);
     void triggerCallback(const std::shared_ptr<const geometry_msgs::msg::PoseStamped> &msg);
     void odometryCallback(const std::shared_ptr<const nav_msgs::msg::Odometry> &msg);
     void swarmTrajsCallback(const std::shared_ptr<const traj_utils::msg::MultiBsplines> &msg);
