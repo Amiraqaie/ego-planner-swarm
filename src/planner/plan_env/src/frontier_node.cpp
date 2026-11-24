@@ -737,9 +737,14 @@ private:
       arr.markers.push_back(m);
 
       geometry_msgs::msg::Pose pc;
-      pc.position.x = f.avg.x();
-      pc.position.y = f.avg.y();
-      pc.position.z = f.avg.z();
+      // A geometric centroid can lie in a wall or in unknown space.
+      const auto center = std::min_element(f.cells.begin(), f.cells.end(),
+        [&](const Vec3 & a, const Vec3 & b) {
+          return (a - f.avg).squaredNorm() < (b - f.avg).squaredNorm();
+        });
+      pc.position.x = center->x();
+      pc.position.y = center->y();
+      pc.position.z = center->z();
       pc.orientation.w = 1.0;
       centers.poses.push_back(pc);
 

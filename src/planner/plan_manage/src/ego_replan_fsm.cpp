@@ -126,6 +126,20 @@ namespace ego_planner
 
     if (target_type_ == TARGET_TYPE::MANUAL_TARGET)
     {
+      frontier_centers_sub_ = node_->create_subscription<geometry_msgs::msg::PoseArray>(
+          "/frontier/centers", 1,
+          [this](geometry_msgs::msg::PoseArray::ConstSharedPtr msg)
+          {
+            frontier_centers_ = std::move(msg);
+            frontier_received_ = std::chrono::steady_clock::now();
+          });
+      goal_preview_service_ = node_->create_service<nav_msgs::srv::GetPlan>(
+          "/ego/preview_goal",
+          [this](const std::shared_ptr<nav_msgs::srv::GetPlan::Request> request,
+                 std::shared_ptr<nav_msgs::srv::GetPlan::Response> response)
+          {
+            previewGoal(*request, *response);
+          });
       waypoint_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
           goal_topic,        // was "/move_base_simple/goal"
           1,
@@ -206,12 +220,12 @@ namespace ego_planner
     planNextWaypoint(wps_[wp_id_]);
   }
 
-  void EGOReplanFSM::planNextWaypoint(const Eigen::Vector3d next_wp, bool restart)
+  void EGOReplanFSM::planNextWaypoint(const Eigen::Vector3d next_wp, bool restart, bool exact)
   {
-    bool success = planGlobalRoute(next_wp);
-
+    bool success = planGlobalRoute(next_wp, exact);
     if (success)
     {
+      exact_global_goal_ = exact;
       end_pt_ = next_wp;
 
       constexpr double step_size_t = 0.1;
@@ -331,7 +345,8 @@ namespace ego_planner
 
     px4_offboard_.poll();
     init_pt_ = odom_pos_;
-    planNextWaypoint(end_wp, true);   // true = hard restart
+    const bool exact = explicit_z && use_astar_global_ && planner_manager_->grid_map_->useFreeSpaceOnly();
+    planNextWaypoint(end_wp, true, exact);
   }
 
   void EGOReplanFSM::odometryCallback(const std::shared_ptr<const nav_msgs::msg::Odometry> &msg)
@@ -672,7 +687,7 @@ namespace ego_planner
             (now_t - last_route_time).seconds() > 1.0)
         {
           last_route_time = now_t;
-          planGlobalRoute(end_pt_);
+          planGlobalRoute(end_pt_, exact_global_goal_);
         }
 
         if (continously_called_times_ > 200)   // give up instead of retrying forever
@@ -709,7 +724,7 @@ namespace ego_planner
         if (globalPathBlocked())
         {
           RCLCPP_WARN(node_->get_logger(), "Global path blocked, re-routing");
-          if (planGlobalRoute(end_pt_))
+          if (planGlobalRoute(end_pt_, exact_global_goal_))
           {
             have_new_target_ = true;
             changeFSMExecState(REPLAN_TRAJ, "GLOBAL");
@@ -1048,13 +1063,74 @@ namespace ego_planner
     broadcast_bspline_pub_->publish(bspline);
   }
 
-  bool EGOReplanFSM::planGlobalRoute(const Eigen::Vector3d &goal)
+  void EGOReplanFSM::previewGoal(const nav_msgs::srv::GetPlan::Request &request,
+                                 nav_msgs::srv::GetPlan::Response &response)
+  {
+    using namespace std::chrono_literals;
+    auto map = planner_manager_->grid_map_;
+    if (!have_odom_ || !odom_pos_.allFinite() || request.goal.header.frame_id != "map" ||
+        !use_astar_global_ || !map->useFreeSpaceOnly())
+      return;
+
+    const auto & p = request.goal.pose.position;
+    const Eigen::Vector3d requested(p.x, p.y, p.z);
+    if (!requested.allFinite())
+      return;
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto deadline = now + 250ms;
+    std::vector<Eigen::Vector3d> path;
+    auto reachable = [&](const Eigen::Vector3d &candidate) {
+      return std::chrono::steady_clock::now() < deadline &&
+             (candidate - odom_pos_).norm() >= 0.25 &&
+             map->searchFreePath(odom_pos_, candidate, path, true, deadline);
+    };
+    if (!reachable(requested))
+    {
+      if (!(request.tolerance > 0.f) || !frontier_centers_ ||
+          frontier_centers_->header.frame_id != "map" || now - frontier_received_ > 3s)
+        return;
+      std::vector<Eigen::Vector3d> candidates;
+      for (const auto & pose : frontier_centers_->poses)
+      {
+        const auto & c = pose.position;
+        Eigen::Vector3d center(c.x, c.y, c.z);
+        if (map->isKnownFreePosition(center) && (center - requested).norm() <= request.tolerance)
+          candidates.push_back(center);
+      }
+      std::sort(candidates.begin(), candidates.end(), [&](const auto & a, const auto & b) {
+        return (a - requested).squaredNorm() < (b - requested).squaredNorm();
+      });
+      if (std::find_if(candidates.begin(), candidates.end(), reachable) == candidates.end())
+        return;
+    }
+
+    response.plan.header.frame_id = "map";
+    response.plan.header.stamp = node_->now();
+    for (const auto & point : path)
+    {
+      geometry_msgs::msg::PoseStamped waypoint;
+      waypoint.header = response.plan.header;
+      waypoint.pose.position.x = point.x();
+      waypoint.pose.position.y = point.y();
+      waypoint.pose.position.z = point.z();
+      waypoint.pose.orientation.w = 1.0;
+      response.plan.poses.push_back(waypoint);
+    }
+  }
+
+  bool EGOReplanFSM::planGlobalRoute(const Eigen::Vector3d &goal, bool exact)
   {
     auto map = planner_manager_->grid_map_;
     if (use_astar_global_ && map->useFreeSpaceOnly())
     {
       std::vector<Eigen::Vector3d> path;
-      const bool reached = map->searchFreePath(odom_pos_, goal, path);
+      const bool reached = map->searchFreePath(odom_pos_, goal, path, exact);
+      if (exact && !reached)
+      {
+        RCLCPP_WARN(node_->get_logger(), "3D goal is no longer reachable through known free space.");
+        return false;
+      }
       if (!reached && path.size() >= 2 && (path.back() - odom_pos_).norm() < 0.5)
       {
         RCLCPP_ERROR(node_->get_logger(),
@@ -1075,6 +1151,8 @@ namespace ego_planner
           return true;
         }
       }
+      if (exact)
+        return false;
       RCLCPP_WARN(node_->get_logger(), "Free-space A* failed, using straight line");
     }
     return planner_manager_->planGlobalTraj(

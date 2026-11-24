@@ -253,11 +253,22 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   // eng_ = default_random_engine(rd());
 }
 
+bool GridMap::isKnownFreePosition(const Eigen::Vector3d &pos)
+{
+  if (!pos.allFinite() || !isInMap(pos))
+    return false;
+  Eigen::Vector3i id;
+  posToIndex(pos, id);
+  const int address = toAddress(id);
+  return md_.free_buffer_[address] == 1 && md_.occupancy_buffer_inflate_[address] == 0;
+}
+
 bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
-                             std::vector<Eigen::Vector3d> &path)
+                             std::vector<Eigen::Vector3d> &path, bool exact,
+                             std::chrono::steady_clock::time_point deadline)
 {
   path.clear();
-  if (!isInMap(start) || !isInMap(goal))
+  if (!isInMap(start) || !isInMap(goal) || (exact && !isKnownFreePosition(goal)))
     return false;
 
   const int s = std::max(1, mp_.free_astar_stride_);
@@ -277,6 +288,27 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
   Eigen::Vector3i si, gi;
   posToIndex(start, si);
   posToIndex(goal, gi);
+  auto segFree = [&](const Eigen::Vector3d &a, const Eigen::Vector3d &b) {
+    const double len = (b - a).norm();
+    const int samples = std::max(1, static_cast<int>(std::ceil(len / (0.5 * mp_.resolution_))));
+    for (int i = 0; i <= samples; ++i)
+    {
+      Eigen::Vector3i id;
+      posToIndex(a + (b - a) * (static_cast<double>(i) / samples), id);
+      // A scan can leave the drone's current voxel unobserved. Escape only
+      // that voxel, and only if it is outside the inflated obstacles.
+      if (exact && id == si && md_.occupancy_buffer_inflate_[toAddress(si)] == 0)
+        continue;
+      if (!passable(id))
+        return false;
+    }
+    return true;
+  };
+  if (exact && (goal - start).norm() <= mp_.free_astar_max_seg_ && segFree(start, goal))
+  {
+    path = {start, goal};
+    return true;
+  }
   auto h = [&](const Eigen::Vector3i &id) { return static_cast<float>((id - gi).cast<float>().norm()); };
 
   struct Q { float f; int adr; };
@@ -302,10 +334,20 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
     if (cur.f - h(id) > gc + 1e-3f)
       continue;   // stale queue entry
     ++expanded;
+    if (exact && expanded % 128 == 0 && std::chrono::steady_clock::now() >= deadline)
+      return false;
 
     const float hc = h(id);
     if (hc < best_h) { best_h = hc; best = cur.adr; }
-    if ((id - gi).cwiseAbs().maxCoeff() <= s) { goal_adr = cur.adr; break; }
+    Eigen::Vector3d current;
+    indexToPos(id, current);
+    if (cur.adr == s_adr)
+      current = start;
+    if ((id - gi).cwiseAbs().maxCoeff() <= s && (!exact || segFree(current, goal)))
+    {
+      goal_adr = cur.adr;
+      break;
+    }
 
     for (int dx = -1; dx <= 1; ++dx)
       for (int dy = -1; dy <= 1; ++dy)
@@ -316,6 +358,13 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
           const Eigen::Vector3i nb = id + Eigen::Vector3i(dx, dy, dz) * s;
           if (!passable(nb))
             continue;
+          if (exact)
+          {
+            Eigen::Vector3d neighbor;
+            indexToPos(nb, neighbor);
+            if (!segFree(current, neighbor))
+              continue;
+          }
           const int na = toAddress(nb);
           const float ng = gc + s * std::sqrt(static_cast<float>(dx * dx + dy * dy + dz * dz));
           auto it = g.find(na);
@@ -328,6 +377,8 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
   }
 
   const bool reached = goal_adr >= 0;
+  if (exact && !reached)
+    return false;
   std::vector<Eigen::Vector3d> raw;
   for (int a = reached ? goal_adr : best; a != -1; a = parent[a])
   {
@@ -336,24 +387,20 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
     raw.push_back(p);
   }
   std::reverse(raw.begin(), raw.end());
+  raw.front() = start;
+  if (exact && reached)
+  {
+    if ((raw.back() - goal).norm() > 1e-6)
+      raw.push_back(goal);
+  }
+  else if (reached)
+  {
+    raw.back() = goal;
+  }
   if (raw.size() < 2)
     return false;
-  raw.front() = start;
-  if (reached)
-    raw.back() = goal;
 
-  // string-pulling: skip nodes while the straight segment stays passable
-  auto segFree = [&](const Eigen::Vector3d &a, const Eigen::Vector3d &b) {
-    const double len = (b - a).norm();
-    for (double d = 0.0; d <= len; d += mp_.resolution_)
-    {
-      Eigen::Vector3i id;
-      posToIndex(a + (b - a) * (len > 1e-6 ? d / len : 0.0), id);
-      if (!passable(id))
-        return false;
-    }
-    return true;
-  };
+  // String-pulling preserves the exact endpoint and only shortcuts free segments.
 
   path.push_back(raw.front());
   size_t i = 0;

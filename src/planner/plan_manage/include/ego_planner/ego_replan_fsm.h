@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <iostream>
 #include "nav_msgs/msg/path.hpp"
+#include "nav_msgs/srv/get_plan.hpp"
+#include "geometry_msgs/msg/pose_array.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -68,6 +70,7 @@ namespace ego_planner
     bool enable_fail_safe_;
     double default_goal_height_ = 1.0;
     bool use_astar_global_{false};
+    bool exact_global_goal_{false};
     
     /* planning data */
     bool have_trigger_, have_target_, have_odom_, have_new_target_, have_recv_pre_agent_;
@@ -97,6 +100,10 @@ namespace ego_planner
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr waypoint_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr waypoint_3d_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr frontier_centers_sub_;
+    geometry_msgs::msg::PoseArray::ConstSharedPtr frontier_centers_;
+    std::chrono::steady_clock::time_point frontier_received_;
+    rclcpp::Service<nav_msgs::srv::GetPlan>::SharedPtr goal_preview_service_;
     rclcpp::Subscription<traj_utils::msg::MultiBsplines>::SharedPtr swarm_trajs_sub_;
     rclcpp::Subscription<traj_utils::msg::Bspline>::SharedPtr broadcast_bspline_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr trigger_sub_;
@@ -120,9 +127,11 @@ namespace ego_planner
     void printFSMExecState();
 
     void readGivenWps();
-    void planNextWaypoint(const Eigen::Vector3d next_wp, bool restart = false);
+    void planNextWaypoint(const Eigen::Vector3d next_wp, bool restart = false, bool exact = false);
     void getLocalTarget();
-    bool planGlobalRoute(const Eigen::Vector3d &goal);
+    bool planGlobalRoute(const Eigen::Vector3d &goal, bool exact);
+    void previewGoal(const nav_msgs::srv::GetPlan::Request &request,
+                     nav_msgs::srv::GetPlan::Response &response);
     bool globalPathBlocked();
 
     /* ROS functions */

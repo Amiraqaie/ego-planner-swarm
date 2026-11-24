@@ -1,6 +1,7 @@
 #ifndef _GRID_MAP_H
 #define _GRID_MAP_H
 
+#include <chrono>
 #include <Eigen/Eigen>
 #include <Eigen/StdVector>
 #include <cv_bridge/cv_bridge.h>
@@ -214,8 +215,11 @@ public:
   bool getOdomDepthTimeout() { return md_.flag_depth_odom_timeout_; }
   bool useFreeSpaceOnly() { return mp_.use_free_space_only_; }
   bool isUnseen(const Eigen::Vector3d &pos);   // not seen free, not obstacle
+  bool isKnownFreePosition(const Eigen::Vector3d &pos);
   bool searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
-                      std::vector<Eigen::Vector3d> &path);
+                      std::vector<Eigen::Vector3d> &path, bool exact = false,
+                      std::chrono::steady_clock::time_point deadline =
+                        std::chrono::steady_clock::time_point::max());
   typedef std::shared_ptr<GridMap> Ptr;
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
