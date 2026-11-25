@@ -12,6 +12,8 @@
 //   unknown = octomap has no node there AND it is not inside inflated obstacle space AND inside the box
 //   view ray blocked by: octomap occupied, grid obstacle (raw), or unknown
 
+#include "plan_env/octomap_bounds.h"
+
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
@@ -81,9 +83,9 @@ struct ObstacleGrid
     origin = lo;
     res = resolution;
     inv = 1.0 / res;
-    nx = std::max(1, static_cast<int>(std::ceil((hi.x() - lo.x()) * inv)));
-    ny = std::max(1, static_cast<int>(std::ceil((hi.y() - lo.y()) * inv)));
-    nz = std::max(1, static_cast<int>(std::ceil((hi.z() - lo.z()) * inv)));
+    nx = std::max(1, static_cast<int>(std::ceil((hi.x() - lo.x()) * inv - 1e-6)));
+    ny = std::max(1, static_cast<int>(std::ceil((hi.y() - lo.y()) * inv - 1e-6)));
+    nz = std::max(1, static_cast<int>(std::ceil((hi.z() - lo.z()) * inv - 1e-6)));
     const size_t n = static_cast<size_t>(nx) * ny * nz;
     occ.assign(n, 0);
     inf.assign(n, 0);
@@ -158,11 +160,11 @@ class FrontierNode : public rclcpp::Node
 public:
   FrontierNode() : Node("frontier_node")
   {
+    full_map_updates_ = declare_parameter<bool>("full_map_updates", false);
     // ---- planner box (also the obstacle grid extent) ----
     auto bmin = declare_parameter<std::vector<double>>("out_min", {-21.0, -15.0, -0.2});
     auto bmax = declare_parameter<std::vector<double>>("out_max", {21.0, 15.0, 7.8});
-    out_min_ = Vec3(bmin[0], bmin[1], bmin[2]);
-    out_max_ = Vec3(bmax[0], bmax[1], bmax[2]);
+
 
     // ---- obstacles ----
     obstacle_source_ = declare_parameter<std::string>("obstacle_source", "octomap");  // octomap | laser_map
@@ -212,10 +214,16 @@ public:
     }
     use_laser_ = (obstacle_source_ == "laser_map");
 
-    grid_.init(out_min_, out_max_, grid_res_, inflation_radius_);
-    RCLCPP_INFO(get_logger(), "obstacle source: %s | grid %dx%dx%d (%.0f MB) | inflation %.2f m (%zu offsets)",
-                obstacle_source_.c_str(), grid_.nx, grid_.ny, grid_.nz,
-                2.0 * grid_.occ.size() / 1e6, inflation_radius_, grid_.sphere.size());
+    if (full_map_updates_ && use_laser_)
+      throw std::invalid_argument("Full-map frontier bounds require OctoMap obstacles");
+    if (!full_map_updates_)
+    {
+      out_min_ = Vec3(bmin.at(0), bmin.at(1), bmin.at(2));
+      out_max_ = Vec3(bmax.at(0), bmax.at(1), bmax.at(2));
+      grid_.init(out_min_, out_max_, grid_res_, inflation_radius_);
+    }
+    RCLCPP_INFO(get_logger(), "obstacle source: %s | bounds: %s | inflation: %.2f m",
+                obstacle_source_.c_str(), full_map_updates_ ? "OctoMap" : "configured", inflation_radius_);
 
     octo_sub_ = create_subscription<octomap_msgs::msg::Octomap>(
         "octomap_full", rclcpp::QoS(1),
@@ -323,7 +331,7 @@ private:
           for (int z = lo[2]; z <= hi[2]; ++z) grid_.add(x, y, z);
     };
 
-    if (has_odom && iterate_range_ > 0.0) {
+    if (!full_map_updates_ && has_odom && iterate_range_ > 0.0) {
       // obstacles that can inflate into the iteration box: range + inflation radius + margin
       const double m = iterate_range_ + inflation_radius_ + 2 * res_;
       const octomap::point3d bmin(pos.x() - m, pos.y() - m, pos.z() - m);
@@ -363,6 +371,38 @@ private:
     res_ = tree_->getResolution();
 
     std::lock_guard<std::mutex> gl(grid_mtx_);  // grid is shared with the laser callback
+
+    if (full_map_updates_)
+    {
+      const auto bounds = octomapBounds(*tree_, grid_res_, inflation_radius_);
+      if (!bounds)
+      {
+        publish({}, msg->header);
+        if (tree_->size() != 0)
+          RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+                                "OctoMap bounds exceed the frontier grid capacity");
+        return;
+      }
+      const Vec3 upper = bounds->origin + bounds->cells.cast<double>() * grid_res_;
+      if (grid_.occ.empty() || bounds->origin != out_min_ || upper != out_max_)
+      {
+        try
+        {
+          ObstacleGrid updated;
+          updated.init(bounds->origin, upper, grid_res_, inflation_radius_);
+          grid_ = std::move(updated);
+        }
+        catch (const std::bad_alloc &)
+        {
+          publish({}, msg->header);
+          RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+                                "Unable to allocate the full OctoMap frontier grid");
+          return;
+        }
+        out_min_ = bounds->origin;
+        out_max_ = upper;
+      }
+    }
 
     if (use_laser_) {
       if (!laser_received_) {
@@ -441,7 +481,7 @@ private:
         }
     };
 
-    if (has_odom && iterate_range_ > 0.0) {
+    if (!full_map_updates_ && has_odom && iterate_range_ > 0.0) {
       const octomap::point3d bmin(pos.x() - iterate_range_, pos.y() - iterate_range_, pos.z() - iterate_range_);
       const octomap::point3d bmax(pos.x() + iterate_range_, pos.y() + iterate_range_, pos.z() + iterate_range_);
       for (auto it = tree_->begin_leafs_bbx(bmin, bmax), end = tree_->end_leafs_bbx(); it != end; ++it)
@@ -672,7 +712,7 @@ private:
   {
     if (inflated_pub_->get_subscription_count() == 0) return;
     Vec3 lo = out_min_, hi = out_max_;
-    if (has_odom && iterate_range_ > 0.0) {
+    if (!full_map_updates_ && has_odom && iterate_range_ > 0.0) {
       lo = lo.cwiseMax(pos - Vec3::Constant(iterate_range_));
       hi = hi.cwiseMin(pos + Vec3::Constant(iterate_range_));
     }
@@ -781,6 +821,7 @@ private:
   // ================================================================== members
   Vec3 out_min_, out_max_;
   std::string obstacle_source_;
+  bool full_map_updates_{false};
   bool use_laser_{false};
   double inflation_radius_, grid_res_, obs_zmin_, obs_zmax_, laser_min_period_;
   int laser_stride_;

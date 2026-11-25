@@ -1,4 +1,5 @@
 #include "plan_env/grid_map.h"
+#include "plan_env/octomap_bounds.h"
 
 // #define current_img_ md_.depth_image_[image_cnt_ & 1]
 // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
@@ -119,16 +120,15 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   mp_.free_publish_stride_ = std::max(1, mp_.free_publish_stride_);
   RCLCPP_INFO(node_->get_logger(), "Map input: obstacles=%s, free=%s, updates=%s",
               obstacle_source.c_str(), mp_.use_free_space_only_ ? free_source.c_str() : "disabled",
+              usesOctomapBounds() ? "OctoMap bounds" :
               mp_.full_map_updates_ ? "full planner bounds" : "local ranges");
 
-  if (mp_.virtual_ceil_height_ - mp_.ground_height_ > z_size)
+  if (!usesOctomapBounds() && mp_.virtual_ceil_height_ - mp_.ground_height_ > z_size)
   {
     mp_.virtual_ceil_height_ = mp_.ground_height_ + z_size;
   }
 
   mp_.resolution_inv_ = 1 / mp_.resolution_;
-  mp_.map_origin_ = Eigen::Vector3d(-x_size / 2.0, -y_size / 2.0, mp_.ground_height_);
-  mp_.map_size_ = Eigen::Vector3d(x_size, y_size, z_size);
 
   mp_.prob_hit_log_ = logit(mp_.p_hit_);
   mp_.prob_miss_log_ = logit(mp_.p_miss_);
@@ -143,24 +143,18 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   cout << "max: " << mp_.clamp_max_log_ << endl;
   cout << "thresh log: " << mp_.min_occupancy_log_ << endl;
 
-  for (int i = 0; i < 3; ++i)
-    mp_.map_voxel_num_(i) = ceil(mp_.map_size_(i) / mp_.resolution_);
-
-  mp_.map_min_boundary_ = mp_.map_origin_;
-  mp_.map_max_boundary_ = mp_.map_origin_ + mp_.map_size_;
-
-  // initialize data buffers
-
-  int buffer_size = mp_.map_voxel_num_(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2);
-
-  md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
-  md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
-
-  md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
-  md_.count_hit_ = vector<short>(buffer_size, 0);
-  md_.flag_rayend_ = vector<char>(buffer_size, -1);
-  md_.flag_traverse_ = vector<char>(buffer_size, -1);
-  md_.free_buffer_ = vector<char>(buffer_size, 0);
+  if (usesOctomapBounds())
+  {
+    // Keep a single unknown voxel until the first snapshot supplies the map bounds.
+    allocateGrid(Eigen::Vector3d::Zero(), Eigen::Vector3d::Constant(mp_.resolution_),
+                 Eigen::Vector3i::Ones());
+  }
+  else
+  {
+    const Eigen::Vector3d size(x_size, y_size, z_size);
+    allocateGrid(Eigen::Vector3d(-x_size / 2., -y_size / 2., mp_.ground_height_), size,
+                 (size.array() * mp_.resolution_inv_).ceil().cast<int>());
+  }
 
   md_.raycast_num_ = 0;
 
@@ -270,6 +264,39 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   // rand_noise2_ = normal_distribution<double>(0, 0.2);
   // random_device rd;
   // eng_ = default_random_engine(rd());
+}
+
+bool GridMap::usesOctomapBounds() const
+{
+  return mp_.full_map_updates_ && mp_.obstacles_from_octomap_ && mp_.free_from_octomap_ &&
+         mp_.use_free_space_only_;
+}
+
+void GridMap::allocateGrid(const Eigen::Vector3d &origin, const Eigen::Vector3d &size,
+                          const Eigen::Vector3i &cells)
+{
+  const auto count = static_cast<size_t>(cells.x()) * cells.y() * cells.z();
+  std::vector<double> occupancy(count, mp_.clamp_min_log_ - mp_.unknown_flag_);
+  std::vector<char> inflated(count, 0), free(count, 0);
+
+  // The OctoMap import does not use the depth raycast buffers.
+  if (!usesOctomapBounds())
+  {
+    md_.count_hit_and_miss_.assign(count, 0);
+    md_.count_hit_.assign(count, 0);
+    md_.flag_rayend_.assign(count, -1);
+    md_.flag_traverse_.assign(count, -1);
+  }
+  md_.occupancy_buffer_.swap(occupancy);
+  md_.occupancy_buffer_inflate_.swap(inflated);
+  md_.free_buffer_.swap(free);
+  mp_.map_origin_ = origin;
+  mp_.map_size_ = size;
+  mp_.map_voxel_num_ = cells;
+  mp_.map_min_boundary_ = origin;
+  mp_.map_max_boundary_ = origin + size;
+  md_.local_bound_min_.setZero();
+  md_.local_bound_max_ = cells - Eigen::Vector3i::Ones();
 }
 
 bool GridMap::isKnownFreePosition(const Eigen::Vector3d &pos)
@@ -947,7 +974,7 @@ void GridMap::publishFreeSpace()
   Eigen::Vector3i lo(0, 0, 0);
   Eigen::Vector3i hi = mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
 
-  if (mp_.free_publish_range_ > 0.0 && md_.has_odom_)
+  if (!mp_.full_map_updates_ && mp_.free_publish_range_ > 0.0 && md_.has_odom_)
   {
     const Eigen::Vector3d r = Eigen::Vector3d::Constant(mp_.free_publish_range_);
     posToIndex(md_.camera_pos_ - r, lo);
@@ -956,7 +983,7 @@ void GridMap::publishFreeSpace()
     boundIndex(hi);
   }
 
-  const int st = std::max(1, mp_.free_publish_stride_);
+  const int st = mp_.full_map_updates_ ? 1 : mp_.free_publish_stride_;
 
   pcl::PointCloud<pcl::PointXYZ> cloud;
   pcl::PointXYZ pt;
@@ -1137,11 +1164,17 @@ bool GridMap::isUnseen(const Eigen::Vector3d &pos)
 void GridMap::forceFreeAroundOdom()
 {
   // lidar min range leaves unknown voxels around the body: force them free
-  if (!md_.has_odom_ || mp_.free_around_odom_ <= 0.0)
+  if (!md_.has_odom_ || !md_.camera_pos_.allFinite() || mp_.free_around_odom_ <= 0.0)
     return;
+  const Eigen::Vector3d radius = Eigen::Vector3d::Constant(mp_.free_around_odom_);
+  const Eigen::Vector3d lo = (md_.camera_pos_ - radius).cwiseMax(mp_.map_min_boundary_);
+  const Eigen::Vector3d hi = (md_.camera_pos_ + radius).cwiseMin(mp_.map_max_boundary_);
+  if ((lo.array() >= hi.array()).any())
+    return;
+
   Eigen::Vector3i lo_id, hi_id;
-  posToIndex(md_.camera_pos_ - Eigen::Vector3d::Constant(mp_.free_around_odom_), lo_id);
-  posToIndex(md_.camera_pos_ + Eigen::Vector3d::Constant(mp_.free_around_odom_), hi_id);
+  posToIndex(lo, lo_id);
+  posToIndex(hi, hi_id);
   boundIndex(lo_id);
   boundIndex(hi_id);
   for (int x = lo_id(0); x <= hi_id(0); ++x)
@@ -1164,6 +1197,36 @@ void GridMap::freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedP
     RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
                          "OctoMap input must contain a full OcTree");
     return;
+  }
+
+  if (usesOctomapBounds())
+  {
+    const auto bounds = plan_env::octomapBounds(*tree, mp_.resolution_, mp_.obstacles_inflation_);
+    bool usable = bounds.has_value();
+    if (usable && (bounds->origin != mp_.map_origin_ || bounds->cells != mp_.map_voxel_num_))
+    {
+      try
+      {
+        allocateGrid(bounds->origin, bounds->cells.cast<double>() * mp_.resolution_, bounds->cells);
+      }
+      catch (const std::bad_alloc &)
+      {
+        usable = false;
+      }
+    }
+    if (!usable)
+    {
+      // Never keep a traversable copy of a stale snapshot when the input cannot be represented.
+      std::fill(md_.free_buffer_.begin(), md_.free_buffer_.end(), 0);
+      std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(),
+                mp_.clamp_min_log_ - mp_.unknown_flag_);
+      resetBuffer();
+      md_.has_cloud_ = false;
+      if (tree->size() != 0)
+        RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                              "OctoMap bounds exceed the planner's grid capacity");
+      return;
+    }
   }
 
   // A full OctoMap is a snapshot. Clear old cells so changes and deletions are visible.
@@ -1415,7 +1478,7 @@ void GridMap::publishMap()
 
         Eigen::Vector3d pos;
         indexToPos(Eigen::Vector3i(x, y, z), pos);
-        if (pos(2) > mp_.visualization_truncate_height_)
+        if (!usesOctomapBounds() && pos(2) > mp_.visualization_truncate_height_)
           continue;
 
         pt.x = pos(0);
@@ -1465,7 +1528,7 @@ void GridMap::publishMapInflate(bool all_info)
 
         Eigen::Vector3d pos;
         indexToPos(Eigen::Vector3i(x, y, z), pos);
-        if (pos(2) > mp_.visualization_truncate_height_)
+        if (!usesOctomapBounds() && pos(2) > mp_.visualization_truncate_height_)
           continue;
 
         pt.x = pos(0);

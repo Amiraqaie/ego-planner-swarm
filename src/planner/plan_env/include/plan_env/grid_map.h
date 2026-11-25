@@ -240,6 +240,9 @@ private:
 
   void freeCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void trimFreeBuffer();
+  bool usesOctomapBounds() const;
+  void allocateGrid(const Eigen::Vector3d &origin, const Eigen::Vector3d &size,
+                    const Eigen::Vector3i &cells);
   void applyVirtualCeiling();
   void freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedPtr msg);
   void forceFreeAroundOdom();
