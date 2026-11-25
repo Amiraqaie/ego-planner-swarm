@@ -1571,9 +1571,15 @@ namespace ego_planner
     return end - static_cast<int>((1.0 - collision_check_fraction_) * std::max(0, end - order_));
   }
 
-  bool BsplineOptimizer::firstCollision(UniformBspline &trajectory, double &time)
+  bool BsplineOptimizer::isCompleteTrajectoryClear(UniformBspline &trajectory)
   {
-    const double end = trajectory.getTimeSum() * collision_check_fraction_;
+    double collision_time;
+    return !firstCollision(trajectory, collision_time, 1.0);
+  }
+
+  bool BsplineOptimizer::firstCollision(UniformBspline &trajectory, double &time, double fraction)
+  {
+    const double end = trajectory.getTimeSum() * fraction;
     const auto velocity = trajectory.getDerivative();
     const double speed_bound = velocity.getMaxControlPointNorm();
     if (!std::isfinite(end) || end < 0.0 || !std::isfinite(speed_bound))
@@ -1663,7 +1669,7 @@ namespace ego_planner
         /*** collision check, phase 2 ***/
         UniformBspline traj(cps_.points, 3, bspline_interval_);
         double collision_time;
-        flag_occ = firstCollision(traj, collision_time);
+        flag_occ = firstCollision(traj, collision_time, collision_check_fraction_);
         if (flag_occ && collision_time <= bspline_interval_)
         {
           RCLCPP_WARN(rclcpp::get_logger("rebound_optimize"),
@@ -1794,7 +1800,7 @@ namespace ego_planner
 
       UniformBspline traj(cps_.points, 3, bspline_interval_);
       double collision_time;
-      flag_safe = !firstCollision(traj, collision_time);
+      flag_safe = !firstCollision(traj, collision_time, collision_check_fraction_);
 
       // 如果存在碰撞则调整参数并重新迭代
       if (!flag_safe)

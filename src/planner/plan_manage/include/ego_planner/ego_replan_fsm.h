@@ -135,6 +135,13 @@ namespace ego_planner
     void readGivenWps();
     void planNextWaypoint(const Eigen::Vector3d next_wp, bool restart = false, bool exact = false);
     void getLocalTarget();
+    bool planDynamicTrajectory();
+    void setReferenceRoute(const std::vector<Eigen::Vector3d> &route);
+    bool dynamic_planning_horizon_ = false;
+    std::vector<Eigen::Vector3d> reference_route_;
+    size_t reference_segment_ = 0;
+    std::optional<Eigen::Vector3d> failed_full_start_;
+    std::chrono::steady_clock::time_point failed_full_time_;
     bool planGlobalRoute(const Eigen::Vector3d &goal, bool exact);
     nav_msgs::msg::Path previewGoal(const geometry_msgs::msg::PoseStamped &goal,
                                     double tolerance, std::string &rejection_reason,

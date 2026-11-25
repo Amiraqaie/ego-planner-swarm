@@ -47,7 +47,8 @@ namespace ego_planner
 
   bool EGOPlannerManager::reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
-                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
+                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj,
+                                        const std::vector<Eigen::Vector3d> &route_seed)
   {
     static int count = 0;
     printf("\033[47;30m\n[drone %d replan %d]==============================================\033[0m\n", pp_.drone_id, count++);
@@ -71,7 +72,34 @@ namespace ego_planner
     vector<Eigen::Vector3d> point_set, start_end_derivatives;
     static bool flag_first_call = true, flag_force_polynomial = false;
     bool flag_regenerate = false;
-    do
+    if (!route_seed.empty())
+    {
+      std::vector<double> arc(route_seed.size(), 0.0);
+      for (size_t i = 1; i < route_seed.size(); ++i)
+        arc[i] = arc[i - 1] + (route_seed[i] - route_seed[i - 1]).norm();
+      const double length = arc.back();
+      const double required_intervals = std::ceil(length / pp_.ctrl_pt_dist);
+      // Avoid unbounded spline fits on very large maps. A smaller candidate
+      // remains available to the dynamic horizon when this budget is exceeded.
+      constexpr int max_intervals = 256;
+      if (!std::isfinite(required_intervals) || required_intervals > max_intervals)
+        return false;
+      const int intervals = std::max(6, static_cast<int>(required_intervals));
+      const double spacing = length / intervals;
+      ts = 1.5 * spacing / pp_.max_vel_;
+      size_t edge = 1;
+      for (int k = 0; k < intervals; ++k)
+      {
+        const double d = k * spacing;
+        while (edge + 1 < arc.size() && arc[edge] <= d)
+          ++edge;
+        const double u = (d - arc[edge - 1]) / (arc[edge] - arc[edge - 1]);
+        point_set.push_back(route_seed[edge - 1] + u * (route_seed[edge] - route_seed[edge - 1]));
+      }
+      point_set.push_back(local_target_pt);
+      start_end_derivatives = {start_vel, local_target_vel, start_acc, Eigen::Vector3d::Zero()};
+    }
+    else do
     {
       point_set.clear();
       start_end_derivatives.clear();
@@ -328,6 +356,17 @@ namespace ego_planner
 
     // t_refine = ros::Time::now() - t_start;
     t_refine = rclcpp::Clock().now() - t_start;
+
+    if (!route_seed.empty())
+    {
+      const double duration = pos.getTimeSum();
+      const double max_error = std::max(0.1, grid_map_->getResolution());
+      if (!std::isfinite(duration) || duration <= 0.0 ||
+          !pos.evaluateDeBoorT(duration).allFinite() ||
+          (pos.evaluateDeBoorT(duration) - local_target_pt).norm() > max_error ||
+          !bspline_optimizer_->isCompleteTrajectoryClear(pos))
+        return false;
+    }
 
     // save planned results
     updateTrajInfo(pos, rclcpp::Clock().now());
