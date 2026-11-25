@@ -44,6 +44,7 @@ namespace ego_planner
     Eigen::VectorXd getKnot();
     Eigen::MatrixXd getControlPoint();
     double getInterval();
+    double getMaxControlPointNorm() const;
     bool getTimeSpan(double &um, double &um_p);
 
     // compute position / derivative

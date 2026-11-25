@@ -19,6 +19,10 @@ namespace ego_planner
     node->declare_parameter("optimization/max_acc", -1.0);
 
     node->declare_parameter("optimization/order", 3);
+    collision_check_fraction_ = node->declare_parameter("planning/collision_check_fraction", 1.0);
+    if (!std::isfinite(collision_check_fraction_) || collision_check_fraction_ <= 0.0 ||
+        collision_check_fraction_ > 1.0)
+      throw std::invalid_argument("planning/collision_check_fraction must be in (0, 1]");
 
     node->get_parameter("optimization/lambda_smooth", lambda1_);
     node->get_parameter("optimization/lambda_collision", lambda2_);
@@ -493,22 +497,23 @@ namespace ego_planner
     /*** Segment the initial trajectory according to obstacles ***/
     // 进入或离开障碍物稳定的时间间隔
     constexpr int ENOUGH_INTERVAL = 2;
-    // 障碍物检测的步长
-    double step_size = grid_map_->getResolution() / ((init_points.col(0) - init_points.rightCols(1)).norm() / (init_points.cols() - 1)) / 1.5;
     int in_id = -1, out_id = -1;
     vector<std::pair<int, int>> segment_ids;
     int same_occ_state_times = ENOUGH_INTERVAL + 1;
     bool occ, last_occ = false;
     // 标识片段的起点和终点是否找到
     bool flag_got_start = false, flag_got_end = false, flag_got_end_maybe = false;
-    int i_end = (int)init_points.cols() - order_ - ((int)init_points.cols() - 2 * order_) / 3; // only check closed 2/3 points.
+    const int i_end = collisionCheckEndIndex(init_points.cols() - order_);
     // 遍历所有点
     for (int i = order_; i <= i_end; ++i)
     {
       // cout << " *" << i-1 << "*" ;
       //  相邻两个点之间进行线性插值并检测障碍物
-      for (double a = 1.0; a > 0.0; a -= step_size)
+      const double length = (init_points.col(i) - init_points.col(i - 1)).norm();
+      const int samples = std::max(1, static_cast<int>(std::ceil(2 * length / grid_map_->getResolution())));
+      for (int j = 0; j < samples + (i == i_end); ++j)
       {
+        const double a = 1.0 - static_cast<double>(j) / samples;
         // TODO:没搞懂这是干嘛的
         occ = grid_map_->getInflateOccupancy(a * init_points.col(i - 1) + (1 - a) * init_points.col(i));
         // cout << " " << occ;
@@ -540,7 +545,7 @@ namespace ego_planner
         }
 
         // 如果已经离开障碍物，则结束
-        if (flag_got_end_maybe && (same_occ_state_times > ENOUGH_INTERVAL || (i == (int)init_points.cols() - order_)))
+        if (flag_got_end_maybe && (same_occ_state_times > ENOUGH_INTERVAL || (i == i_end)))
         {
           flag_got_end_maybe = false;
           flag_got_end = true;
@@ -874,7 +879,7 @@ namespace ego_planner
   void BsplineOptimizer::calcSwarmCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient)
   {
     cost = 0.0;
-    int end_idx = q.cols() - order_ - (double)(q.cols() - 2 * order_) * 1.0 / 3.0; // Only check the first 2/3 points
+    const int end_idx = collisionCheckEndIndex(q.cols() - order_);
     const double CLEARANCE = swarm_clearance_ * 2;
     double t_now = rclcpp::Clock().now().seconds();
     constexpr double a = 2.0, b = 1.0, inv_a2 = 1 / a / a, inv_b2 = 1 / b / b;
@@ -1327,7 +1332,7 @@ namespace ego_planner
     int in_id, out_id;
     vector<std::pair<int, int>> segment_ids;
     bool flag_new_obs_valid = false;
-    int i_end = end_idx - (end_idx - order_) / 3;
+    const int i_end = collisionCheckEndIndex(end_idx);
     for (int i = order_ - 1; i <= i_end; ++i)
     {
 
@@ -1561,6 +1566,32 @@ namespace ego_planner
   }
 
   // 使用L-BFGS方法对目标函数进行优化，得到光滑、无碰撞、动力学可行、与其他无人机碰撞、结束项的轨迹。
+  int BsplineOptimizer::collisionCheckEndIndex(int end) const
+  {
+    return end - static_cast<int>((1.0 - collision_check_fraction_) * std::max(0, end - order_));
+  }
+
+  bool BsplineOptimizer::firstCollision(UniformBspline &trajectory, double &time)
+  {
+    const double end = trajectory.getTimeSum() * collision_check_fraction_;
+    const auto velocity = trajectory.getDerivative();
+    const double speed_bound = velocity.getMaxControlPointNorm();
+    if (!std::isfinite(end) || end < 0.0 || !std::isfinite(speed_bound))
+    {
+      time = 0.0;
+      return true;
+    }
+    // Bound the distance between samples using the derivative control points.
+    const double step = 0.5 * grid_map_->getResolution() / std::max(speed_bound, 1e-6);
+    for (time = 0.0;; time = std::min(time + step, end))
+    {
+      if (grid_map_->getInflateOccupancy(trajectory.evaluateDeBoorT(time)))
+        return true;
+      if (time >= end)
+        return false;
+    }
+  }
+
   bool BsplineOptimizer::rebound_optimize(double &final_cost)
   {
     iter_num_ = 0;
@@ -1629,37 +1660,15 @@ namespace ego_planner
         }
 
         /*** collision check, phase 2 ***/
-        // 创建均匀的B样条曲线
-        UniformBspline traj = UniformBspline(cps_.points, 3, bspline_interval_);
-        // 开始时间，结束时间
-        double tm, tmp;
-        traj.getTimeSpan(tm, tmp);
-        // 计算时间步长
-        double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution());
-        // 遍历轨迹的前2/3部分进行障碍物检测
-        for (double t = tm; t < tmp * 2 / 3; t += t_step) // Only check the closest 2/3 partition of the whole trajectory.
+        UniformBspline traj(cps_.points, 3, bspline_interval_);
+        double collision_time;
+        flag_occ = firstCollision(traj, collision_time);
+        if (flag_occ && collision_time <= bspline_interval_)
         {
-          flag_occ = grid_map_->getInflateOccupancy(traj.evaluateDeBoorT(t));
-          if (flag_occ)
-          {
-            // cout << "hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
-
-            // 如果在前三个控制点范围内检测到了碰撞则视为不可行
-            if (t <= bspline_interval_) // First 3 control points in obstacles!
-            {
-              // cout << cps_.points.col(1).transpose() << "\n"
-              //      << cps_.points.col(2).transpose() << "\n"
-              //      << cps_.points.col(3).transpose() << "\n"
-              //      << cps_.points.col(4).transpose() << endl;
-              RCLCPP_WARN(rclcpp::get_logger("rebound_optimize"), "First 3 control points in obstacles! return false, t=%f", t);
-              return false;
-            }
-
-            break;
-          }
+          RCLCPP_WARN(rclcpp::get_logger("rebound_optimize"),
+                      "Trajectory starts in an obstacle, t=%f", collision_time);
+          return false;
         }
-
-        // cout << "XXXXXX" << ((cps_.points.col(cps_.points.cols()-1) + 4*cps_.points.col(cps_.points.cols()-2) + cps_.points.col(cps_.points.cols()-3))/6 - local_target_pt_).norm() << endl;
 
         /*** collision check, phase 3 ***/
 // #define USE_SECOND_CLEARENCE_CHECK
@@ -1782,28 +1791,9 @@ namespace ego_planner
                                         "Solver error in refining!, return = %d, %s", result, lbfgs::lbfgs_strerror(result));
       }
 
-      // 使用优化后的控制点创建新的轨迹
-      UniformBspline traj = UniformBspline(cps_.points, 3, bspline_interval_);
-      double tm, tmp;
-      traj.getTimeSpan(tm, tmp);
-      double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution()); // Step size is defined as the maximum size that can passes throgth every gird.
-      for (double t = tm; t < tmp * 2 / 3; t += t_step)
-      {
-        if (grid_map_->getInflateOccupancy(traj.evaluateDeBoorT(t)))
-        {
-          // cout << "Refined traj hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
-
-          // 将ref_pts存储为矩阵形式
-          Eigen::MatrixXd ref_pts(ref_pts_.size(), 3);
-          for (size_t i = 0; i < ref_pts_.size(); i++)
-          {
-            ref_pts.row(i) = ref_pts_[i].transpose();
-          }
-
-          flag_safe = false;
-          break;
-        }
-      }
+      UniformBspline traj(cps_.points, 3, bspline_interval_);
+      double collision_time;
+      flag_safe = !firstCollision(traj, collision_time);
 
       // 如果存在碰撞则调整参数并重新迭代
       if (!flag_safe)

@@ -280,6 +280,11 @@ namespace ego_planner
     // cout << "[B-spline]: parameterization ok." << endl;
   }
 
+  double UniformBspline::getMaxControlPointNorm() const
+  {
+    return control_points_.cols() ? control_points_.colwise().norm().maxCoeff() : 0.0;
+  }
+
   double UniformBspline::getTimeSum()
   {
     double tm, tmp;

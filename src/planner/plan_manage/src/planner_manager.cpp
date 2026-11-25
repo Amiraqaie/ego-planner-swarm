@@ -372,7 +372,7 @@ namespace ego_planner
     double other_traj_start_time = swarm_trajs_buf_[drone_id].start_time_.seconds();
 
     double t_start = max(my_traj_start_time, other_traj_start_time);
-    double t_end = min(my_traj_start_time + local_data_.duration_ * 2 / 3, other_traj_start_time + swarm_trajs_buf_[drone_id].duration_);
+    double t_end = min(my_traj_start_time + local_data_.duration_ * getCollisionCheckFraction(), other_traj_start_time + swarm_trajs_buf_[drone_id].duration_);
 
     for (double t = t_start; t < t_end; t += 0.03)
     {

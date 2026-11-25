@@ -907,23 +907,25 @@ namespace ego_planner
     }
 
     /* ---------- check trajectory ---------- */
-    constexpr double time_step = 0.01;
-    // double t_cur = (ros::Time::now() - info->start_time_).toSec();
-    double t_cur = (rclcpp::Clock().now() - info->start_time_).seconds();
-
-    Eigen::Vector3d p_cur = info->position_traj_.evaluateDeBoorT(t_cur);
-    const double CLEARANCE = 1.0 * planner_manager_->getSwarmClearance();
-    // double t_cur_global = ros::Time::now().toSec();
-    double t_cur_global = rclcpp::Clock().now().seconds();
-
-    double t_2_3 = info->duration_ * 2 / 3;
-    for (double t = t_cur; t < info->duration_; t += time_step)
+    const double t_cur = (rclcpp::Clock().now() - info->start_time_).seconds();
+    if (t_cur > info->duration_)
+      return;
+    const double fraction_end = info->duration_ * planner_manager_->getCollisionCheckFraction();
+    const double end = t_cur < fraction_end ? fraction_end : info->duration_;
+    const double speed_bound = info->velocity_traj_.getMaxControlPointNorm();
+    if (!std::isfinite(end) || !std::isfinite(t_cur) || !std::isfinite(speed_bound))
     {
-      if (t_cur < t_2_3 && t >= t_2_3) // If t_cur < t_2_3, only the first 2/3 partition of the trajectory is considered valid and will get checked.
-        break;
+      changeFSMExecState(EMERGENCY_STOP, "INVALID_TRAJECTORY");
+      return;
+    }
+    const double time_step = std::min(0.01, 0.5 * map->getResolution() / std::max(speed_bound, 1e-6));
+    const double CLEARANCE = planner_manager_->getSwarmClearance();
 
+    for (double t = std::max(0.0, t_cur);; t = std::min(t + time_step, end))
+    {
+      const Eigen::Vector3d position = info->position_traj_.evaluateDeBoorT(t);
       bool occ = false;
-      occ |= map->getInflateOccupancy(info->position_traj_.evaluateDeBoorT(t));
+      occ |= map->getInflateOccupancy(position);
 
       for (size_t id = 0; id < planner_manager_->swarm_trajs_buf_.size(); id++)
       {
@@ -932,9 +934,11 @@ namespace ego_planner
           continue;
         }
 
-        double t_X = t_cur_global - planner_manager_->swarm_trajs_buf_.at(id).start_time_.seconds();
-        Eigen::Vector3d swarm_pridicted = planner_manager_->swarm_trajs_buf_.at(id).position_traj_.evaluateDeBoorT(t_X);
-        double dist = (p_cur - swarm_pridicted).norm();
+        auto &other = planner_manager_->swarm_trajs_buf_.at(id);
+        const double other_time = (info->start_time_ - other.start_time_).seconds() + t;
+        if (other_time < 0.0 || other_time > other.duration_)
+          continue;
+        const double dist = (position - other.position_traj_.evaluateDeBoorT(other_time)).norm();
 
         if (dist < CLEARANCE)
         {
@@ -969,6 +973,8 @@ namespace ego_planner
         }
         break;
       }
+      if (t >= end)
+        break;
     }
   }
 

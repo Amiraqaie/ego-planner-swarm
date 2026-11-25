@@ -44,6 +44,7 @@ namespace ego_planner
 
     double getSwarmClearance(void) { return bspline_optimizer_->getSwarmClearance(); }
 
+    double getCollisionCheckFraction() const { return bspline_optimizer_->getCollisionCheckFraction(); }
     bool checkCollision(int drone_id);
     
 
