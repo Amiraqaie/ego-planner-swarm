@@ -48,6 +48,11 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   const auto obstacle_source =
       node_->declare_parameter<std::string>("grid_map/obstacle_source", "cloud_depth");
   mp_.obstacles_from_octomap_ = obstacle_source == "octomap";
+  mp_.soft_clearance_radius_ = node_->declare_parameter("grid_map/soft_clearance_radius", 1.0);
+  mp_.soft_clearance_weight_ = node_->declare_parameter("grid_map/soft_clearance_weight", 2.0);
+  if (!std::isfinite(mp_.soft_clearance_radius_) || mp_.soft_clearance_radius_ < 0 ||
+      !std::isfinite(mp_.soft_clearance_weight_) || mp_.soft_clearance_weight_ < 0)
+    throw std::invalid_argument("Soft clearance radius and weight must be finite and nonnegative");
   const bool use_cloud = obstacle_source == "cloud" || obstacle_source == "cloud_depth";
   const bool use_depth = obstacle_source == "depth" || obstacle_source == "cloud_depth";
   if (!mp_.obstacles_from_octomap_ && !use_cloud && !use_depth)
@@ -290,6 +295,8 @@ void GridMap::allocateGrid(const Eigen::Vector3d &origin, const Eigen::Vector3d 
   md_.occupancy_buffer_.swap(occupancy);
   md_.occupancy_buffer_inflate_.swap(inflated);
   md_.free_buffer_.swap(free);
+  clearance_cost_.clear();
+  clearance_obstacles_.clear();
   mp_.map_origin_ = origin;
   mp_.map_size_ = size;
   mp_.map_voxel_num_ = cells;
@@ -309,6 +316,114 @@ bool GridMap::isKnownFreePosition(const Eigen::Vector3d &pos)
   return md_.free_buffer_[address] == 1 && md_.occupancy_buffer_inflate_[address] == 0;
 }
 
+void GridMap::updateSoftClearance()
+{
+  if (mp_.soft_clearance_radius_ <= 0 || mp_.soft_clearance_weight_ <= 0)
+    return;
+
+  const auto &occupancy = md_.occupancy_buffer_;
+  std::vector<int> obstacles;
+  for (size_t i = 0; i < occupancy.size(); ++i)
+    if (occupancy[i] > mp_.min_occupancy_log_)
+      obstacles.push_back(static_cast<int>(i));
+  if (obstacles == clearance_obstacles_)
+    return;
+  clearance_obstacles_.swap(obstacles);
+  if (clearance_obstacles_.empty())
+  {
+    clearance_cost_.clear();
+    return;
+  }
+
+  const double radius = mp_.soft_clearance_radius_;
+  const double limit = std::pow(radius * mp_.resolution_inv_ + 0.5, 2);
+  clearance_cost_.assign(occupancy.size(), limit);
+  for (const int i : clearance_obstacles_)
+    clearance_cost_[i] = 0;
+
+  // The lower envelope of parabolas gives squared Euclidean distances in
+  // linear time per axis. The radius cap limits the resulting cost field.
+  const Eigen::Vector3i dims = mp_.map_voxel_num_;
+  std::vector<int> sites(dims.maxCoeff());
+  std::vector<double> breaks(dims.maxCoeff() + 1), input(dims.maxCoeff());
+  for (int axis = 0; axis < 3; ++axis)
+  {
+    const int b = (axis + 1) % 3, c = (axis + 2) % 3;
+    Eigen::Vector3i index = Eigen::Vector3i::Zero();
+    Eigen::Vector3i offset = Eigen::Vector3i::Unit(axis);
+    const int stride = toAddress(offset);
+    for (index[b] = 0; index[b] < dims[b]; ++index[b])
+      for (index[c] = 0; index[c] < dims[c]; ++index[c])
+      {
+        const int base = toAddress(index);
+        for (int q = 0; q < dims[axis]; ++q)
+          input[q] = clearance_cost_[base + q * stride];
+        int k = 0;
+        sites[0] = 0;
+        breaks[0] = -std::numeric_limits<double>::infinity();
+        for (int q = 1; q < dims[axis]; ++q)
+        {
+          auto intersection = [&]() {
+            const double p = sites[k];
+            return ((input[q] - input[sites[k]]) / (q - p) + q + p) * 0.5;
+          };
+          double x = intersection();
+          while (x <= breaks[k])
+          {
+            --k;
+            x = intersection();
+          }
+          sites[++k] = q;
+          breaks[k] = x;
+        }
+        breaks[k + 1] = std::numeric_limits<double>::infinity();
+        k = 0;
+        for (int q = 0; q < dims[axis]; ++q)
+        {
+          while (breaks[k + 1] < q)
+            ++k;
+          const double d = q - sites[k];
+          clearance_cost_[base + q * stride] = std::min(limit, input[sites[k]] + d * d);
+        }
+      }
+  }
+  for (float &value : clearance_cost_)
+  {
+    const double distance = std::max(0.0, (std::sqrt(value) - 0.5) * mp_.resolution_);
+    const double proximity = std::max(0.0, 1.0 - distance / radius);
+    value = mp_.soft_clearance_weight_ * proximity * proximity;
+  }
+}
+
+double GridMap::softClearanceCost(const Eigen::Vector3d &pos, Eigen::Vector3d &gradient)
+{
+  gradient.setZero();
+  if (!hasSoftClearance() || !pos.allFinite() || !isInMap(pos))
+    return 0.0;
+  const Eigen::Array3d coord = (pos - mp_.map_origin_).array() * mp_.resolution_inv_ - 0.5;
+  const Eigen::Array3d cell = coord.floor();
+  const Eigen::Array3d fraction = coord - cell;
+  const Eigen::Vector3i lo = cell.cast<int>().matrix();
+  double cost = 0.0;
+  for (int corner = 0; corner < 8; ++corner)
+  {
+    Eigen::Vector3i id = lo;
+    Eigen::Array3d weight, derivative;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+      const bool upper = (corner & (1 << axis)) != 0;
+      id[axis] = std::clamp(id[axis] + upper, 0, mp_.map_voxel_num_[axis] - 1);
+      weight[axis] = upper ? fraction[axis] : 1.0 - fraction[axis];
+      derivative[axis] = upper ? mp_.resolution_inv_ : -mp_.resolution_inv_;
+    }
+    const double value = clearance_cost_[toAddress(id)];
+    cost += value * weight.prod();
+    for (int axis = 0; axis < 3; ++axis)
+      gradient[axis] += value * derivative[axis] * weight[(axis + 1) % 3] * weight[(axis + 2) % 3];
+  }
+  return cost;
+}
+
 bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
                              std::vector<Eigen::Vector3d> &path, bool exact,
                              std::chrono::steady_clock::time_point deadline,
@@ -323,6 +438,8 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
   const int s = std::max(1, mp_.free_astar_stride_);
   const int ny = mp_.map_voxel_num_(1);
   const int nz = mp_.map_voxel_num_(2);
+  const bool soft = hasSoftClearance();
+  const float infinity = std::numeric_limits<float>::infinity();
 
   auto passable = [&](const Eigen::Vector3i &id) {
     if (!isInMap(id))
@@ -337,28 +454,39 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
   Eigen::Vector3i si, gi;
   posToIndex(start, si);
   posToIndex(goal, gi);
-  auto segFree = [&](const Eigen::Vector3d &a, const Eigen::Vector3d &b) {
+  auto segmentCost = [&](const Eigen::Vector3d &a, const Eigen::Vector3d &b) -> float {
     const double len = (b - a).norm();
     const int samples = std::max(1, static_cast<int>(std::ceil(len / (0.5 * mp_.resolution_))));
+    double penalty = 0.0;
     for (int i = 0; i <= samples; ++i)
     {
       Eigen::Vector3i id;
       posToIndex(a + (b - a) * (static_cast<double>(i) / samples), id);
       // A scan can leave the drone's current voxel unobserved. Escape only
       // that voxel, and only if it is outside the inflated obstacles.
-      if (exact && id == si && md_.occupancy_buffer_inflate_[toAddress(si)] == 0)
-        continue;
-      if (!passable(id))
-        return false;
+      if (!(exact && id == si && md_.occupancy_buffer_inflate_[toAddress(si)] == 0) && !passable(id))
+        return infinity;
+      if (soft)
+        penalty += clearance_cost_[toAddress(id)] * (i == 0 || i == samples ? 0.5 : 1.0);
     }
-    return true;
+    return len * mp_.resolution_inv_ * (1.0 + penalty / samples);
   };
-  if (exact && (goal - start).norm() <= mp_.free_astar_max_seg_ && segFree(start, goal))
+  const float direct = exact && (goal - start).norm() <= mp_.free_astar_max_seg_
+      ? segmentCost(start, goal) : infinity;
+  if (std::isfinite(direct) && (!soft || direct <= (goal - start).norm() * mp_.resolution_inv_ + 1e-5))
   {
     path = {start, goal};
     return true;
   }
-  auto h = [&](const Eigen::Vector3i &id) { return static_cast<float>((id - gi).cast<float>().norm()); };
+  auto h = [&](const Eigen::Vector3i &id) -> float {
+    if (!soft)
+      return (id - gi).cast<float>().norm();
+    Eigen::Vector3d p;
+    indexToPos(id, p);
+    if (id == si)
+      p = start;
+    return (p - goal).norm() * mp_.resolution_inv_;
+  };
 
   struct Q { float f; int adr; };
   auto cmp = [](const Q &a, const Q &b) { return a.f > b.f; };
@@ -371,7 +499,8 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
   parent[s_adr] = -1;
   open.push({h(si), s_adr});
 
-  int best = s_adr, goal_adr = -1, expanded = 0;
+  int best = s_adr, goal_adr = std::isfinite(direct) ? s_adr : -1, expanded = 0;
+  float goal_cost = direct;
   float best_h = h(si);
 
   while (!open.empty() && expanded < mp_.free_astar_max_nodes_)
@@ -382,12 +511,16 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
     const float gc = g[cur.adr];
     if (cur.f - h(id) > gc + 1e-3f)
       continue;   // stale queue entry
+    if (soft && exact && cur.f >= goal_cost)
+      break;
     ++expanded;
     if (exact && expanded % 128 == 0 && std::chrono::steady_clock::now() >= deadline)
     {
       if (search_limit_hit)
         *search_limit_hit = true;
-      return false;
+      if (goal_adr < 0)
+        return false;
+      break;
     }
 
     const float hc = h(id);
@@ -396,10 +529,16 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
     indexToPos(id, current);
     if (cur.adr == s_adr)
       current = start;
-    if ((id - gi).cwiseAbs().maxCoeff() <= s && (!exact || segFree(current, goal)))
+    if ((id - gi).cwiseAbs().maxCoeff() <= s)
     {
-      goal_adr = cur.adr;
-      break;
+      const float tail = exact ? segmentCost(current, goal) : 0.0f;
+      if (std::isfinite(tail) && gc + tail < goal_cost)
+      {
+        goal_adr = cur.adr;
+        goal_cost = gc + tail;
+        if (!soft || !exact)
+          break;
+      }
     }
 
     for (int dx = -1; dx <= 1; ++dx)
@@ -411,15 +550,19 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
           const Eigen::Vector3i nb = id + Eigen::Vector3i(dx, dy, dz) * s;
           if (!passable(nb))
             continue;
-          if (exact)
+          float step_cost = s * std::sqrt(static_cast<float>(dx * dx + dy * dy + dz * dz));
+          if (exact || soft)
           {
             Eigen::Vector3d neighbor;
             indexToPos(nb, neighbor);
-            if (!segFree(current, neighbor))
+            const float checked = segmentCost(current, neighbor);
+            if (!std::isfinite(checked))
               continue;
+            if (soft)
+              step_cost = checked;
           }
           const int na = toAddress(nb);
-          const float ng = gc + s * std::sqrt(static_cast<float>(dx * dx + dy * dy + dz * dz));
+          const float ng = gc + step_cost;
           auto it = g.find(na);
           if (it != g.end() && it->second <= ng)
             continue;
@@ -455,16 +598,30 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
   if (raw.size() < 2)
     return false;
 
-  // String-pulling preserves the exact endpoint and only shortcuts free segments.
+  // Keep a shortcut only if it preserves the clearance benefit of the search.
+  std::vector<double> prefix_cost;
+  if (soft)
+  {
+    prefix_cost.assign(raw.size(), 0.0);
+    for (size_t i = 1; i < raw.size(); ++i)
+      prefix_cost[i] = prefix_cost[i - 1] + segmentCost(raw[i - 1], raw[i]);
+  }
 
   path.push_back(raw.front());
   size_t i = 0;
   while (i + 1 < raw.size())
   {
     size_t j = raw.size() - 1;
-    while (j > i + 1 &&
-           ((raw[j] - raw[i]).norm() > mp_.free_astar_max_seg_ || !segFree(raw[i], raw[j])))
+    while (j > i + 1)
+    {
+      if ((raw[j] - raw[i]).norm() <= mp_.free_astar_max_seg_)
+      {
+        const float shortcut = segmentCost(raw[i], raw[j]);
+        if (std::isfinite(shortcut) && (!soft || shortcut <= prefix_cost[j] - prefix_cost[i] + 1e-4))
+          break;
+      }
       --j;
+    }
     path.push_back(raw[j]);
     i = j;
   }
@@ -1230,6 +1387,8 @@ void GridMap::freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedP
       std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(),
                 mp_.clamp_min_log_ - mp_.unknown_flag_);
       resetBuffer();
+      clearance_cost_.clear();
+      clearance_obstacles_.clear();
       md_.has_cloud_ = false;
       if (tree->size() != 0)
         RCLCPP_ERROR_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
@@ -1306,7 +1465,10 @@ void GridMap::freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedP
       importLeaf(it);
   }
   if (import_obstacles)
+  {
     applyVirtualCeiling();
+    updateSoftClearance();
+  }
   if (import_free)
     forceFreeAroundOdom();
 }

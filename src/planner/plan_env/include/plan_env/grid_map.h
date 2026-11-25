@@ -61,6 +61,7 @@ struct MappingParameters
   Eigen::Vector3d local_update_range_;
   double resolution_, resolution_inv_;
   double obstacles_inflation_;
+  double soft_clearance_radius_, soft_clearance_weight_;
   string frame_id_;
   int pose_type_;
 
@@ -218,6 +219,8 @@ public:
   bool useFreeSpaceOnly() { return mp_.use_free_space_only_; }
   bool isUnseen(const Eigen::Vector3d &pos);   // not seen free, not obstacle
   bool isKnownFreePosition(const Eigen::Vector3d &pos);
+  double softClearanceCost(const Eigen::Vector3d &pos, Eigen::Vector3d &gradient);
+  bool hasSoftClearance() const { return !clearance_cost_.empty(); }
   bool waitingForOctomap() const { return mp_.obstacles_from_octomap_ && !md_.has_cloud_; }
   bool searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
                       std::vector<Eigen::Vector3d> &path, bool exact = false,
@@ -231,6 +234,9 @@ public:
 private:
   MappingParameters mp_;
   MappingData md_;
+  std::vector<float> clearance_cost_;
+  std::vector<int> clearance_obstacles_;
+  void updateSoftClearance();
 
   // get depth image and camera pose
   void depthPoseCallback(const sensor_msgs::msg::Image::ConstPtr &img,

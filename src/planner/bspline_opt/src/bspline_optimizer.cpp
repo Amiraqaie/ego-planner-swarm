@@ -1000,6 +1000,29 @@ namespace ego_planner
     }
   }
 
+  void BsplineOptimizer::calcSoftClearanceCost(const Eigen::MatrixXd &q, double &cost,
+                                                 Eigen::MatrixXd &gradient)
+  {
+    if (order_ != 3 || !grid_map_->hasSoftClearance() || q.cols() < 4)
+      return;
+
+    // Sample the cubic curve between knots. Applying the same basis weights
+    // to the gradient propagates its clearance cost back to the control points.
+    const double sample_weight = 1.0 / (3.0 * (q.cols() - 3));
+    for (const double t : {1.0 / 6, 0.5, 5.0 / 6})
+    {
+      const double t2 = t * t, t3 = t2 * t, a = 1.0 - t;
+      const Eigen::Vector4d basis = Eigen::Vector4d(a * a * a, 3 * t3 - 6 * t2 + 4,
+                                                   -3 * t3 + 3 * t2 + 3 * t + 1, t3) / 6.0;
+      for (Eigen::Index i = 0; i + 3 < q.cols(); ++i)
+      {
+        Eigen::Vector3d slope;
+        cost += sample_weight * grid_map_->softClearanceCost(q.middleCols<4>(i) * basis, slope);
+        gradient.middleCols<4>(i) += sample_weight * slope * basis.transpose();
+      }
+    }
+  }
+
   void BsplineOptimizer::calcFitnessCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient)
   {
 
@@ -1823,11 +1846,14 @@ namespace ego_planner
     calcSwarmCost(cps_.points, f_swarm, g_swarm);
     calcTerminalCost(cps_.points, f_terminal, g_terminal);
 
-    f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_swarm + lambda2_ * f_terminal;
+    double f_clearance = 0.0;
+    Eigen::MatrixXd g_clearance = Eigen::MatrixXd::Zero(3, cps_.points.cols());
+    calcSoftClearanceCost(cps_.points, f_clearance, g_clearance);
+    f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_swarm + lambda2_ * f_terminal + f_clearance;
     // f_combine = lambda1_ * f_smoothness + new_lambda2_ * f_distance + lambda3_ * f_feasibility + new_lambda2_ * f_mov_objs;
     // printf("origin %f %f %f %f\n", f_smoothness, f_distance, f_feasibility, f_combine);
 
-    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_swarm + lambda2_ * g_terminal;
+    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_swarm + lambda2_ * g_terminal + g_clearance;
     // Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility + new_lambda2_ * g_mov_objs;
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }
@@ -1852,10 +1878,13 @@ namespace ego_planner
     calcFeasibilityCost(cps_.points, f_feasibility, g_feasibility);
 
     /* ---------- convert to solver format...---------- */
-    f_combine = lambda1_ * f_smoothness + lambda4_ * f_fitness + lambda3_ * f_feasibility;
+    double f_clearance = 0.0;
+    Eigen::MatrixXd g_clearance = Eigen::MatrixXd::Zero(3, cps_.points.cols());
+    calcSoftClearanceCost(cps_.points, f_clearance, g_clearance);
+    f_combine = lambda1_ * f_smoothness + lambda4_ * f_fitness + lambda3_ * f_feasibility + f_clearance;
     // printf("origin %f %f %f %f\n", f_smoothness, f_fitness, f_feasibility, f_combine);
 
-    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + lambda4_ * g_fitness + lambda3_ * g_feasibility;
+    Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + lambda4_ * g_fitness + lambda3_ * g_feasibility + g_clearance;
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }
 
