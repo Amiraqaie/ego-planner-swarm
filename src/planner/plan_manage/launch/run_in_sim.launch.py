@@ -93,6 +93,7 @@ def generate_launch_description():
         output='screen',
         remappings=[
             ('position_cmd', ['drone_', drone_id, '_planning/pos_cmd']),
+            ('optimal_list', ['drone_', drone_id, '_plan_vis/optimal_list']),
             ('planning/bspline', ['drone_', drone_id, '_planning/bspline'])
         ],
         parameters=[

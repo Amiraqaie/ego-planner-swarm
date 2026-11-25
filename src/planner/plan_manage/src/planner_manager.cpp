@@ -282,7 +282,6 @@ namespace ego_planner
     cout << "plan_success=" << flag_step_1_success << endl;
     if (!flag_step_1_success)
     {
-      visualization_->displayOptimalList(ctrl_pts, 0);
       continous_failures_count_++;
       return false;
     }

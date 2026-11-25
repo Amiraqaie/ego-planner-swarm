@@ -1020,11 +1020,6 @@ namespace ego_planner
 
       /* 1. publish traj to traj_server */
       bspline_pub_->publish(bspline);
-
-      /* 2. publish traj to the next drone of swarm */
-
-      /* 3. publish traj for visualization */
-      visualization_->displayOptimalList(info->position_traj_.get_control_points(), 0);
     }
 
     return plan_and_refine_success;

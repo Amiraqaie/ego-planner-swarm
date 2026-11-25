@@ -102,7 +102,6 @@ def generate_launch_description():
             ('goal_point', ['drone_', drone_id, '_plan_vis/goal_point']),
             ('global_list', ['drone_', drone_id, '_plan_vis/global_list']),
             ('init_list', ['drone_', drone_id, '_plan_vis/init_list']),
-            ('optimal_list', ['drone_', drone_id, '_plan_vis/optimal_list']),
             ('a_star_list', ['drone_', drone_id, '_plan_vis/a_star_list']),
             
             ('grid_map/odom', ['drone_', drone_id, '_', odometry_topic]),

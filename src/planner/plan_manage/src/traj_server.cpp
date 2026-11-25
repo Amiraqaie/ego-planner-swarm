@@ -5,6 +5,7 @@
 #include "std_msgs/msg/empty.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 #include <rclcpp/rclcpp.hpp>
+#include <algorithm>
 #include <cmath>
 #include "std_msgs/msg/int32.hpp"
 #include "ego_planner/px4_offboard.h"
@@ -17,6 +18,8 @@ int64_t goal_reference_traj_id_ = -1;
 int64_t canceled_goal_reference_traj_id_ = -1;
 ego_planner::Px4Offboard px4_offboard_;
 rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub;
+rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr active_path_pub;
+visualization_msgs::msg::Marker active_path_marker;
 
 quadrotor_msgs::msg::PositionCommand cmd;
 double pos_gain[3] = {0, 0, 0};
@@ -42,8 +45,34 @@ void odomCallback(nav_msgs::msg::Odometry::ConstSharedPtr msg)
                     1.0 - 2.0 * (q.y * q.y + q.z * q.z));
 }
 
+void publishActivePath()
+{
+  using visualization_msgs::msg::Marker;
+  // Sample the same spline used by cmdCallback, including its hold point.
+  const int intervals = static_cast<int>(std::clamp(std::ceil(traj_duration_ / 0.05), 1.0, 1000.0));
+  active_path_marker.action = Marker::ADD;
+  active_path_marker.points.clear();
+  active_path_marker.points.reserve(intervals + 1);
+  for (int i = 0; i <= intervals; ++i)
+  {
+    const Eigen::Vector3d position = traj_[0].evaluateDeBoorT(traj_duration_ * (static_cast<double>(i) / intervals));
+    geometry_msgs::msg::Point point;
+    point.x = position.x();
+    point.y = position.y();
+    point.z = position.z();
+    active_path_marker.points.push_back(point);
+  }
+  active_path_pub->publish(active_path_marker);
+}
+
 void clearTrajectory()
 {
+  if (receive_traj_)
+  {
+    active_path_marker.action = visualization_msgs::msg::Marker::DELETE;
+    active_path_marker.points.clear();
+    active_path_pub->publish(active_path_marker);
+  }
   receive_traj_ = false;
   traj_.clear();
   reset_on_next_traj_ = true;
@@ -112,6 +141,10 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
 
   // UniformBspline yaw_traj(yaw_pts, msg->order, msg->yaw_dt);
 
+  const double duration = pos_traj.getTimeSum();
+  if (!std::isfinite(duration) || duration <= 0.0)
+    return;
+
   start_time_ = rclcpp::Time(msg->start_time, RCL_SYSTEM_TIME);
   traj_id_ = msg->traj_id;
 
@@ -120,9 +153,10 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
   traj_.push_back(traj_[0].getDerivative());
   traj_.push_back(traj_[1].getDerivative());
 
-  traj_duration_ = traj_[0].getTimeSum();
+  traj_duration_ = duration;
 
   receive_traj_ = true;
+  publishActivePath();
 }
 
 std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclcpp::Time &time_now, rclcpp::Time &time_last)
@@ -297,6 +331,15 @@ int main(int argc, char **argv)
 {
   rclcpp::init(argc, argv);
   auto node = rclcpp::Node::make_shared("traj_server");
+  active_path_pub = node->create_publisher<visualization_msgs::msg::Marker>(
+      "optimal_list", rclcpp::QoS(1).transient_local());
+  active_path_marker.header.frame_id = "map";
+  active_path_marker.id = 1000;
+  active_path_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+  active_path_marker.pose.orientation.w = 1.0;
+  active_path_marker.scale.x = 0.075;
+  active_path_marker.color.r = 1.0;
+  active_path_marker.color.a = 1.0;
   px4_offboard_.init(*node, cancelOffboardGoal);
 
   auto bspline_sub = node->create_subscription<traj_utils::msg::Bspline>(
@@ -314,6 +357,13 @@ int main(int argc, char **argv)
   auto cmd_timer = node->create_wall_timer(
       std::chrono::milliseconds(10),
       cmdCallback);
+
+  // Refresh the accepted marker for RViz displays using volatile durability.
+  auto marker_timer = node->create_wall_timer(
+      std::chrono::seconds(1), [] {
+        if (receive_traj_)
+          active_path_pub->publish(active_path_marker);
+      });
 
   /* control parameter */
   cmd.kx[0] = pos_gain[0];

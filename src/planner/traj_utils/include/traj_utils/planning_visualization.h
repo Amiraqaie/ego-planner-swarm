@@ -23,7 +23,6 @@ namespace ego_planner
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr goal_point_pub;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr global_list_pub;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr init_list_pub;
-    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr optimal_list_pub;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr a_star_list_pub;
     // ros::Publisher guide_vector_pub;
     // ros::Publisher intermediate_state_pub;
@@ -37,7 +36,6 @@ namespace ego_planner
       goal_point_pub = node_->create_publisher<visualization_msgs::msg::Marker>("goal_point", 2);
       global_list_pub = node_->create_publisher<visualization_msgs::msg::Marker>("global_list", 2);
       init_list_pub = node_->create_publisher<visualization_msgs::msg::Marker>("init_list", 2);
-      optimal_list_pub = node_->create_publisher<visualization_msgs::msg::Marker>("optimal_list", 2);
       a_star_list_pub = node_->create_publisher<visualization_msgs::msg::Marker>("a_star_list", 20);
     }
 
@@ -53,7 +51,6 @@ namespace ego_planner
     void displayGlobalPathList(std::vector<Eigen::Vector3d> global_pts, const double scale, int id);
     void displayInitPathList(std::vector<Eigen::Vector3d> init_pts, const double scale, int id);
     void displayMultiInitPathList(std::vector<std::vector<Eigen::Vector3d>> init_trajs, const double scale);
-    void displayOptimalList(Eigen::MatrixXd optimal_pts, int id);
     void displayAStarList(std::vector<std::vector<Eigen::Vector3d>> a_star_paths, int id);
     void displayArrowList(rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr &pub, const std::vector<Eigen::Vector3d> &list, double scale, Eigen::Vector4d color, int id);
     // void displayIntermediateState(ros::Publisher& intermediate_pub, ego_planner::BsplineOptimizer::Ptr optimizer, double sleep_time, const int start_iteration);

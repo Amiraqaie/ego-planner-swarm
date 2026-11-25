@@ -195,24 +195,6 @@ namespace ego_planner
     displayMarkerList(init_list_pub, init_pts, scale, color, id);
   }
 
-  void PlanningVisualization::displayOptimalList(Eigen::MatrixXd optimal_pts, int id)
-  {
-
-    if (optimal_list_pub->get_subscription_count() == 0)
-    {
-      return;
-    }
-
-    vector<Eigen::Vector3d> list;
-    for (int i = 0; i < optimal_pts.cols(); i++)
-    {
-      Eigen::Vector3d pt = optimal_pts.col(i).transpose();
-      list.push_back(pt);
-    }
-    Eigen::Vector4d color(1, 0, 0, 1);
-    displayMarkerList(optimal_list_pub, list, 0.15, color, id);
-  }
-
   void PlanningVisualization::displayAStarList(std::vector<std::vector<Eigen::Vector3d>> a_star_paths, int id /* = Eigen::Vector4d(0.5,0.5,0,1)*/)
   {
 
