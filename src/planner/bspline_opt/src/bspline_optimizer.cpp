@@ -1585,7 +1585,8 @@ namespace ego_planner
     const double step = 0.5 * grid_map_->getResolution() / std::max(speed_bound, 1e-6);
     for (time = 0.0;; time = std::min(time + step, end))
     {
-      if (grid_map_->getInflateOccupancy(trajectory.evaluateDeBoorT(time)))
+      const Eigen::Vector3d position = trajectory.evaluateDeBoorT(time);
+      if (!position.allFinite() || grid_map_->getInflateOccupancy(position))
         return true;
       if (time >= end)
         return false;
@@ -1674,7 +1675,7 @@ namespace ego_planner
 // #define USE_SECOND_CLEARENCE_CHECK
 #ifdef USE_SECOND_CLEARENCE_CHECK
         bool flag_cls_xyp, flag_cls_xyn, flag_cls_zp, flag_cls_zn;
-        Eigen::Vector3d start_end_vec = traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm);
+        Eigen::Vector3d start_end_vec = traj.evaluateDeBoorT(traj.getTimeSum()) - traj.evaluateDeBoorT(0.0);
         Eigen::Vector3d offset_xy(-start_end_vec(0), start_end_vec(1), 0);
         offset_xy.normalize();
         Eigen::Vector3d offset_z = start_end_vec.cross(offset_xy);

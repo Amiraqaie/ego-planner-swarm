@@ -924,8 +924,7 @@ namespace ego_planner
     for (double t = std::max(0.0, t_cur);; t = std::min(t + time_step, end))
     {
       const Eigen::Vector3d position = info->position_traj_.evaluateDeBoorT(t);
-      bool occ = false;
-      occ |= map->getInflateOccupancy(position);
+      bool occ = !position.allFinite() || map->getInflateOccupancy(position);
 
       for (size_t id = 0; id < planner_manager_->swarm_trajs_buf_.size(); id++)
       {
