@@ -1133,14 +1133,9 @@ namespace ego_planner
           "The route search reached its time or node limit before verifying a path." :
           "The goal voxel is free, but no connected known-free route was found from the drone.";
 
-    if (!global_astar)
-    {
-      if (!rejection_reason.empty())
-        return {};
-      // A single pose confirms the destination alone. There is no global route
-      // or verified frontier alternative in local planning mode.
+    // A single pose confirms the destination alone in local planning mode.
+    if (!global_astar && rejection_reason.empty())
       path.push_back(requested);
-    }
 
     if (!rejection_reason.empty())
     {
@@ -1163,7 +1158,11 @@ namespace ego_planner
       {
         const auto &c = pose.position;
         const Eigen::Vector3d center(c.x, c.y, c.z);
-        if (map->isKnownFreePosition(center) && (center - requested).norm() <= tolerance &&
+        if (!center.allFinite() || !map->isInMap(center))
+          continue;
+        const bool free = known_free_only ? map->isKnownFreePosition(center) :
+            !map->isUnknown(center) && map->getOccupancy(center) == 0 && map->getInflateOccupancy(center) == 0;
+        if (free && (center - requested).norm() <= tolerance &&
             (center - odom_pos_).norm() >= 0.25)
           candidates.push_back(center);
       }
@@ -1178,6 +1177,13 @@ namespace ego_planner
       bool frontier_limit_hit = false;
       for (const auto &candidate : candidates)
       {
+        if (!global_astar)
+        {
+          path.push_back(candidate);
+          // Existing goal tools show the rejection reason beside the suggestion.
+          rejection_reason += " Route unverified for the proposed frontier in local planning mode.";
+          break;
+        }
         if (std::chrono::steady_clock::now() >= deadline)
           break;
         if (map->searchFreePath(odom_pos_, candidate, path, true, deadline, &search_limit_hit))
