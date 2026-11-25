@@ -1,6 +1,6 @@
 // frontier_node.cpp  (v2)
 // Frontier detection on /octomap_full (free space) with a switchable obstacle source:
-//   obstacle_source = "octomap"    : occupied octomap leaves, grid rebuilt every cycle (near the drone)
+//   obstacle_source = "octomap"    : occupied octomap leaves, grid rebuilt each cycle from the configured extent
 //   obstacle_source = "laser_map"  : dense point cloud (e.g. /Laser_map), accumulated into a persistent grid
 //
 // Obstacles are voxelised into a dense grid over the planner box and inflated by a sphere of
@@ -323,7 +323,7 @@ private:
           for (int z = lo[2]; z <= hi[2]; ++z) grid_.add(x, y, z);
     };
 
-    if (has_odom) {
+    if (has_odom && iterate_range_ > 0.0) {
       // obstacles that can inflate into the iteration box: range + inflation radius + margin
       const double m = iterate_range_ + inflation_radius_ + 2 * res_;
       const octomap::point3d bmin(pos.x() - m, pos.y() - m, pos.z() - m);
@@ -441,7 +441,7 @@ private:
         }
     };
 
-    if (has_odom) {
+    if (has_odom && iterate_range_ > 0.0) {
       const octomap::point3d bmin(pos.x() - iterate_range_, pos.y() - iterate_range_, pos.z() - iterate_range_);
       const octomap::point3d bmax(pos.x() + iterate_range_, pos.y() + iterate_range_, pos.z() + iterate_range_);
       for (auto it = tree_->begin_leafs_bbx(bmin, bmax), end = tree_->end_leafs_bbx(); it != end; ++it)
@@ -667,12 +667,12 @@ private:
   }
 
   // ================================================================== output
-  // Debug: inflated obstacle voxels around the drone (only built if someone subscribes)
+  // Debug: inflated voxels in the selected bounds (only built if someone subscribes)
   void publishInflated(const Vec3 & pos, bool has_odom, const std_msgs::msg::Header & h)
   {
     if (inflated_pub_->get_subscription_count() == 0) return;
     Vec3 lo = out_min_, hi = out_max_;
-    if (has_odom) {
+    if (has_odom && iterate_range_ > 0.0) {
       lo = lo.cwiseMax(pos - Vec3::Constant(iterate_range_));
       hi = hi.cwiseMin(pos + Vec3::Constant(iterate_range_));
     }

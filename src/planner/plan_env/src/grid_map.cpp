@@ -43,6 +43,14 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/pose_type", 1);
   node_->declare_parameter("grid_map/frame_id", "map");
   node_->declare_parameter("grid_map/local_map_margin", 1);
+  mp_.full_map_updates_ = node_->declare_parameter("grid_map/full_map_updates", false);
+  const auto obstacle_source =
+      node_->declare_parameter<std::string>("grid_map/obstacle_source", "cloud_depth");
+  mp_.obstacles_from_octomap_ = obstacle_source == "octomap";
+  const bool use_cloud = obstacle_source == "cloud" || obstacle_source == "cloud_depth";
+  const bool use_depth = obstacle_source == "depth" || obstacle_source == "cloud_depth";
+  if (!mp_.obstacles_from_octomap_ && !use_cloud && !use_depth)
+    throw std::invalid_argument("grid_map/obstacle_source must be octomap, cloud, depth or cloud_depth");
   node_->declare_parameter("grid_map/ground_height", 1.0);
   node_->declare_parameter("grid_map/odom_depth_timeout", 1.0);
   node_->declare_parameter("grid_map/use_free_space_only", false);
@@ -109,6 +117,9 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   if (!mp_.free_from_octomap_ && free_source != "scan_cloud")
     RCLCPP_WARN(node_->get_logger(), "free_source '%s' unknown, using scan_cloud", free_source.c_str());
   mp_.free_publish_stride_ = std::max(1, mp_.free_publish_stride_);
+  RCLCPP_INFO(node_->get_logger(), "Map input: obstacles=%s, free=%s, updates=%s",
+              obstacle_source.c_str(), mp_.use_free_space_only_ ? free_source.c_str() : "disabled",
+              mp_.full_map_updates_ ? "full planner bounds" : "local ranges");
 
   if (mp_.virtual_ceil_height_ - mp_.ground_height_ > z_size)
   {
@@ -163,49 +174,53 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
 
   /* init callback */
 
-  // 初始化 message_filters::Subscriber
-  depth_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
-      node_, "grid_map/depth", rclcpp::QoS(50).get_rmw_qos_profile());
-
-  extrinsic_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
-      "/vins_estimator/extrinsic", 10,
-      std::bind(&GridMap::extrinsicCallback, this, std::placeholders::_1));
-
-  if (mp_.pose_type_ == POSE_STAMPED)
+  if (use_depth)
   {
-    pose_sub_ = std::make_shared<message_filters::Subscriber<geometry_msgs::msg::PoseStamped>>(
-        node_, "grid_map/pose", rclcpp::QoS(25).get_rmw_qos_profile());
+    depth_sub_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
+        node_, "grid_map/depth", rclcpp::QoS(50).get_rmw_qos_profile());
 
-    sync_image_pose_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImagePose>>(
-        SyncPolicyImagePose(100), *depth_sub_, *pose_sub_);
-    sync_image_pose_->registerCallback(
-        std::bind(&GridMap::depthPoseCallback, this, std::placeholders::_1, std::placeholders::_2));
+    extrinsic_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
+        "/vins_estimator/extrinsic", 10,
+        std::bind(&GridMap::extrinsicCallback, this, std::placeholders::_1));
+
+    if (mp_.pose_type_ == POSE_STAMPED)
+    {
+      pose_sub_ = std::make_shared<message_filters::Subscriber<geometry_msgs::msg::PoseStamped>>(
+          node_, "grid_map/pose", rclcpp::QoS(25).get_rmw_qos_profile());
+
+      sync_image_pose_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImagePose>>(
+          SyncPolicyImagePose(100), *depth_sub_, *pose_sub_);
+      sync_image_pose_->registerCallback(
+          std::bind(&GridMap::depthPoseCallback, this, std::placeholders::_1, std::placeholders::_2));
+    }
+    else if (mp_.pose_type_ == ODOMETRY)
+    {
+      odom_sub_ = std::make_shared<message_filters::Subscriber<nav_msgs::msg::Odometry>>(
+          node_, "grid_map/odom", rclcpp::QoS(100).get_rmw_qos_profile());
+
+      sync_image_odom_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImageOdom>>(
+          SyncPolicyImageOdom(100), *depth_sub_, *odom_sub_);
+      sync_image_odom_->registerCallback(
+          std::bind(&GridMap::depthOdomCallback, this, std::placeholders::_1, std::placeholders::_2));
+    }
   }
-  else if (mp_.pose_type_ == ODOMETRY)
+
+  if (use_cloud)
   {
-    odom_sub_ = std::make_shared<message_filters::Subscriber<nav_msgs::msg::Odometry>>(
-        node_, "grid_map/odom", rclcpp::QoS(100).get_rmw_qos_profile());
-
-    sync_image_odom_ = std::make_shared<message_filters::Synchronizer<SyncPolicyImageOdom>>(
-        SyncPolicyImageOdom(100), *depth_sub_, *odom_sub_);
-    sync_image_odom_->registerCallback(
-        std::bind(&GridMap::depthOdomCallback, this, std::placeholders::_1, std::placeholders::_2));
+    indep_cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+        "grid_map/cloud", 10, std::bind(&GridMap::cloudCallback, this, std::placeholders::_1));
   }
-
-  // 使用独立的里程计和点云订阅
-  indep_cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-      "grid_map/cloud", 10, std::bind(&GridMap::cloudCallback, this, std::placeholders::_1));
 
   indep_odom_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
       "grid_map/odom", 10, std::bind(&GridMap::odomCallback, this, std::placeholders::_1));
 
-  if (mp_.free_from_octomap_)
+  if (mp_.obstacles_from_octomap_ || (mp_.use_free_space_only_ && mp_.free_from_octomap_))
   {
     free_octomap_sub_ = node_->create_subscription<octomap_msgs::msg::Octomap>(
         "grid_map/free_octomap", rclcpp::QoS(1),
         std::bind(&GridMap::freeOctomapCallback, this, std::placeholders::_1));
   }
-  else
+  if (mp_.use_free_space_only_ && !mp_.free_from_octomap_)
   {
     free_cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
         "grid_map/free_cloud", rclcpp::QoS(5),
@@ -219,10 +234,12 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   free_pub_timer_ = node_->create_wall_timer(
       std::chrono::milliseconds(200), std::bind(&GridMap::publishFreeSpace, this));
 
-  // 定时器
-  occ_timer_ = node_->create_wall_timer(
-      std::chrono::duration<double>(0.05),
-      std::bind(&GridMap::updateOccupancyCallback, this));
+  if (use_depth)
+  {
+    occ_timer_ = node_->create_wall_timer(
+        std::chrono::duration<double>(0.05),
+        std::bind(&GridMap::updateOccupancyCallback, this));
+  }
 
   vis_timer_ = node_->create_wall_timer(
       std::chrono::duration<double>(0.11),
@@ -237,6 +254,8 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   md_.has_first_depth_ = false;
   md_.has_odom_ = false;
   md_.has_cloud_ = false;
+  md_.local_bound_min_.setZero();
+  md_.local_bound_max_.setZero();
   md_.image_cnt_ = 0;
   md_.last_occ_update_time_ = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
 
@@ -418,11 +437,7 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
 
 void GridMap::resetBuffer()
 {
-  Eigen::Vector3d min_pos = mp_.map_min_boundary_;
-  Eigen::Vector3d max_pos = mp_.map_max_boundary_;
-
-  resetBuffer(min_pos, max_pos);
-
+  std::fill(md_.occupancy_buffer_inflate_.begin(), md_.occupancy_buffer_inflate_.end(), 0);
   md_.local_bound_min_ = Eigen::Vector3i::Zero();
   md_.local_bound_max_ = mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
 }
@@ -453,6 +468,8 @@ int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
 
   Eigen::Vector3i id;
   posToIndex(pos, id);
+  if (!isInMap(id))
+    return INVALID_IDX;
   int idx_ctns = toAddress(id);
 
   md_.count_hit_and_miss_[idx_ctns] += 1;
@@ -749,7 +766,7 @@ void GridMap::raycastProcess()
 
     bool in_local = idx(0) >= min_id(0) && idx(0) <= max_id(0) && idx(1) >= min_id(1) &&
                     idx(1) <= max_id(1) && idx(2) >= min_id(2) && idx(2) <= max_id(2);
-    if (!in_local)
+    if (!mp_.full_map_updates_ && !in_local)
     {
       md_.occupancy_buffer_[idx_ctns] = mp_.clamp_min_log_;
     }
@@ -788,6 +805,13 @@ Eigen::Vector3d GridMap::closetPointInMap(const Eigen::Vector3d &pt, const Eigen
 
 void GridMap::clearAndInflateLocalMap()
 {
+  if (mp_.full_map_updates_)
+  {
+    // Keep accumulated depth observations and rebuild inflation over the whole map.
+    md_.local_bound_min_.setZero();
+    md_.local_bound_max_ = mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
+  }
+
   /*clear outside local*/
   const int vec_margin = 5;
   // Eigen::Vector3i min_vec_margin = min_vec - Eigen::Vector3i(vec_margin,
@@ -888,27 +912,25 @@ void GridMap::clearAndInflateLocalMap()
           for (int k = 0; k < (int)inf_pts.size(); ++k)
           {
             inf_pt = inf_pts[k];
-            int idx_inf = toAddress(inf_pt);
-            if (idx_inf < 0 ||
-                idx_inf >= mp_.map_voxel_num_(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2))
-            {
-              continue;
-            }
-            md_.occupancy_buffer_inflate_[idx_inf] = 1;
+            if (isInMap(inf_pt))
+              md_.occupancy_buffer_inflate_[toAddress(inf_pt)] = 1;
           }
         }
       }
 
-  // add virtual ceiling to limit flight height
-  if (mp_.virtual_ceil_height_ > -0.5)
-  {
-    int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
-    for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
-      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
-      {
-        md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
-      }
-  }
+  applyVirtualCeiling();
+}
+
+void GridMap::applyVirtualCeiling()
+{
+  if (mp_.virtual_ceil_height_ <= -0.5)
+    return;
+  const int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
+  if (ceil_id < 0 || ceil_id >= mp_.map_voxel_num_(2))
+    return;
+  for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
+    for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
+      md_.occupancy_buffer_inflate_[toAddress(Eigen::Vector3i(x, y, ceil_id))] = 1;
 }
 
 void GridMap::visCallback()
@@ -1130,76 +1152,97 @@ void GridMap::forceFreeAroundOdom()
 
 void GridMap::freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedPtr msg)
 {
-  if (!mp_.use_free_space_only_)
+  const bool import_free = mp_.use_free_space_only_ && mp_.free_from_octomap_;
+  const bool import_obstacles = mp_.obstacles_from_octomap_;
+  if ((!import_free && !import_obstacles) || msg->header.frame_id != mp_.frame_id_)
     return;
 
   std::unique_ptr<octomap::AbstractOcTree> abstract(octomap_msgs::fullMsgToMap(*msg));
-  octomap::OcTree *tree = dynamic_cast<octomap::OcTree *>(abstract.get());
+  auto *tree = dynamic_cast<octomap::OcTree *>(abstract.get());
   if (!tree)
   {
     RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
-                         "free_octomap: need an octomap_full message holding an OcTree");
+                         "OctoMap input must contain a full OcTree");
     return;
   }
 
-  // the octomap is the whole truth: replace, do not accumulate
-  std::fill(md_.free_buffer_.begin(), md_.free_buffer_.end(), 0);
+  // A full OctoMap is a snapshot. Clear old cells so changes and deletions are visible.
+  if (import_free)
+    std::fill(md_.free_buffer_.begin(), md_.free_buffer_.end(), 0);
+  if (import_obstacles)
+  {
+    std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(),
+              mp_.clamp_min_log_ - mp_.unknown_flag_);
+    resetBuffer();
+    md_.has_cloud_ = true;
+  }
 
-  const int ny = mp_.map_voxel_num_(1);
-  const int nz = mp_.map_voxel_num_(2);
-
-  // only import a box around the drone (free_keep_range <= 0: whole octomap)
-  const bool crop = mp_.free_keep_range_ > 0.0 && md_.has_odom_;
-  const octomap::point3d bmin(md_.camera_pos_(0) - mp_.free_keep_range_,
-                              md_.camera_pos_(1) - mp_.free_keep_range_,
-                              md_.camera_pos_(2) - mp_.free_keep_range_);
-  const octomap::point3d bmax(md_.camera_pos_(0) + mp_.free_keep_range_,
-                              md_.camera_pos_(1) + mp_.free_keep_range_,
-                              md_.camera_pos_(2) + mp_.free_keep_range_);
-
-  auto addLeaf = [&](const auto &it) {
-    if (tree->isNodeOccupied(*it))
+  constexpr double index_epsilon = 1e-3;
+  const int inflate_xy = std::max(0, static_cast<int>(std::ceil(mp_.obstacles_inflation_ * mp_.resolution_inv_)));
+  const Eigen::Vector3i inflation(inflate_xy, inflate_xy, inflate_xy > 0 ? 1 : 0);
+  auto fillBox = [&](auto &buffer, const Eigen::Vector3i &lo, const Eigen::Vector3i &hi, auto value) {
+    for (int x = lo.x(); x <= hi.x(); ++x)
+      for (int y = lo.y(); y <= hi.y(); ++y)
+        std::fill_n(buffer.begin() + toAddress(Eigen::Vector3i(x, y, lo.z())),
+                    hi.z() - lo.z() + 1, value);
+  };
+  auto importLeaf = [&](const auto &it) {
+    const bool occupied = tree->isNodeOccupied(*it);
+    if (!import_obstacles && (occupied || !import_free))
       return;
-    const double h = it.getSize() * 0.5;
-    const octomap::point3d c = it.getCoordinate();
+    const auto center = it.getCoordinate();
+    const double half = it.getSize() * 0.5;
     Eigen::Vector3i lo, hi;
-    for (int i = 0; i < 3; ++i)
+    for (int axis = 0; axis < 3; ++axis)
     {
-      lo(i) = static_cast<int>(floor((c(i) - h - mp_.map_origin_(i)) * mp_.resolution_inv_ + 1e-3));
-      hi(i) = static_cast<int>(ceil((c(i) + h - mp_.map_origin_(i)) * mp_.resolution_inv_ - 1e-3)) - 1;
-      if (hi(i) < lo(i))
-        hi(i) = lo(i);                       // leaf smaller than an EGO voxel
-      if (hi(i) < 0 || lo(i) >= mp_.map_voxel_num_(i))
-        return;                              // outside the EGO map
-      lo(i) = std::max(lo(i), 0);
-      hi(i) = std::min(hi(i), mp_.map_voxel_num_(i) - 1);
+      lo(axis) = static_cast<int>(std::floor(
+          (center(axis) - half - mp_.map_origin_(axis)) * mp_.resolution_inv_ + index_epsilon));
+      hi(axis) = std::max(lo(axis), static_cast<int>(std::ceil(
+          (center(axis) + half - mp_.map_origin_(axis)) * mp_.resolution_inv_ - index_epsilon)) - 1);
+      if (hi(axis) < 0 || lo(axis) >= mp_.map_voxel_num_(axis))
+        return;
     }
-    // split the leaf into EGO-resolution voxels (z is contiguous in memory)
-    for (int x = lo(0); x <= hi(0); ++x)
-      for (int y = lo(1); y <= hi(1); ++y)
+    boundIndex(lo);
+    boundIndex(hi);
+    if (import_obstacles)
+    {
+      fillBox(md_.occupancy_buffer_, lo, hi, occupied ? mp_.clamp_max_log_ : mp_.clamp_min_log_);
+      if (occupied)
       {
-        char *row = md_.free_buffer_.data() + (static_cast<size_t>(x) * ny + y) * nz;
-        std::fill(row + lo(2), row + hi(2) + 1, 1);
+        Eigen::Vector3i inflated_lo = lo - inflation;
+        Eigen::Vector3i inflated_hi = hi + inflation;
+        boundIndex(inflated_lo);
+        boundIndex(inflated_hi);
+        fillBox(md_.occupancy_buffer_inflate_, inflated_lo, inflated_hi, 1);
       }
+    }
+    if (!occupied && import_free)
+      fillBox(md_.free_buffer_, lo, hi, 1);
   };
 
-  if (crop)
+  if (!mp_.full_map_updates_ && mp_.free_keep_range_ > 0.0 && md_.has_odom_)
   {
-    for (auto it = tree->begin_leafs_bbx(bmin, bmax), end = tree->end_leafs_bbx(); it != end; ++it)
-      addLeaf(it);
+    const auto d = Eigen::Vector3d::Constant(mp_.free_keep_range_);
+    const Eigen::Vector3d lo = md_.camera_pos_ - d, hi = md_.camera_pos_ + d;
+    const octomap::point3d min(lo.x(), lo.y(), lo.z()), max(hi.x(), hi.y(), hi.z());
+    for (auto it = tree->begin_leafs_bbx(min, max), end = tree->end_leafs_bbx(); it != end; ++it)
+      importLeaf(it);
   }
   else
   {
     for (auto it = tree->begin_leafs(), end = tree->end_leafs(); it != end; ++it)
-      addLeaf(it);
+      importLeaf(it);
   }
-
-  forceFreeAroundOdom();
+  if (import_obstacles)
+    applyVirtualCeiling();
+  if (import_free)
+    forceFreeAroundOdom();
 }
 
 void GridMap::trimFreeBuffer()
 {
-  if (mp_.free_from_octomap_ || !mp_.use_free_space_only_ || mp_.free_keep_range_ <= 0.0 || !md_.has_odom_)
+  if (mp_.full_map_updates_ || mp_.free_from_octomap_ || !mp_.use_free_space_only_ ||
+      mp_.free_keep_range_ <= 0.0 || !md_.has_odom_)
     return;
 
   const Eigen::Vector3d r = Eigen::Vector3d::Constant(mp_.free_keep_range_);
@@ -1243,20 +1286,24 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
 
   md_.has_cloud_ = true;
 
-  if (!md_.has_odom_)
+  if (!mp_.full_map_updates_ && !md_.has_odom_)
   {
     std::cout << "no odom!" << std::endl;
     return;
   }
 
-  if (latest_cloud.points.size() == 0)
+  if (!mp_.full_map_updates_ && latest_cloud.empty())
     return;
 
-  if (isnan(md_.camera_pos_(0)) || isnan(md_.camera_pos_(1)) || isnan(md_.camera_pos_(2)))
-    return;
-
-  this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
-                    md_.camera_pos_ + mp_.local_update_range_);
+  if (mp_.full_map_updates_)
+    resetBuffer();
+  else
+  {
+    if (!md_.camera_pos_.allFinite())
+      return;
+    resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
+                md_.camera_pos_ + mp_.local_update_range_);
+  }
 
   pcl::PointXYZ pt;
   Eigen::Vector3d p3d, p3d_inf;
@@ -1279,12 +1326,12 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
     pt = latest_cloud.points[i];
     p3d(0) = pt.x, p3d(1) = pt.y, p3d(2) = pt.z;
 
-    /* point inside update range */
-    Eigen::Vector3d devi = p3d - md_.camera_pos_;
+    if (!p3d.allFinite())
+      continue;
     Eigen::Vector3i inf_pt;
 
-    if (fabs(devi(0)) < mp_.local_update_range_(0) && fabs(devi(1)) < mp_.local_update_range_(1) &&
-        fabs(devi(2)) < mp_.local_update_range_(2))
+    if (mp_.full_map_updates_ ||
+        ((p3d - md_.camera_pos_).cwiseAbs().array() < mp_.local_update_range_.array()).all())
     {
 
       /* inflate the point */
@@ -1318,32 +1365,26 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
     }
   }
 
-  min_x = min(min_x, md_.camera_pos_(0));
-  min_y = min(min_y, md_.camera_pos_(1));
-  min_z = min(min_z, md_.camera_pos_(2));
+  if (!mp_.full_map_updates_)
+  {
+    min_x = min(min_x, md_.camera_pos_(0));
+    min_y = min(min_y, md_.camera_pos_(1));
+    min_z = min(min_z, md_.camera_pos_(2));
 
-  max_x = max(max_x, md_.camera_pos_(0));
-  max_y = max(max_y, md_.camera_pos_(1));
-  max_z = max(max_z, md_.camera_pos_(2));
+    max_x = max(max_x, md_.camera_pos_(0));
+    max_y = max(max_y, md_.camera_pos_(1));
+    max_z = max(max_z, md_.camera_pos_(2));
 
-  max_z = max(max_z, mp_.ground_height_);
+    max_z = max(max_z, mp_.ground_height_);
 
-  posToIndex(Eigen::Vector3d(max_x, max_y, max_z), md_.local_bound_max_);
-  posToIndex(Eigen::Vector3d(min_x, min_y, min_z), md_.local_bound_min_);
+    posToIndex(Eigen::Vector3d(max_x, max_y, max_z), md_.local_bound_max_);
+    posToIndex(Eigen::Vector3d(min_x, min_y, min_z), md_.local_bound_min_);
 
-  // 更新局部地图边界
-  boundIndex(md_.local_bound_min_);
-  boundIndex(md_.local_bound_max_);
-
-  // add virtual ceiling to limit flight height
-  // 添加虚拟天花板控制飞行高度
-  if (mp_.virtual_ceil_height_ > -0.5) {
-    int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
-    for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
-      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y) {
-        md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
-      }
+    // 更新局部地图边界
+    boundIndex(md_.local_bound_min_);
+    boundIndex(md_.local_bound_max_);
   }
+  applyVirtualCeiling();
 }
 
 void GridMap::publishMap()

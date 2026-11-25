@@ -101,6 +101,8 @@ struct MappingParameters
   double free_keep_range_;     // m, <=0: never forget
   double free_publish_range_;    // m, box around the drone to publish (<=0: whole map)
   int free_publish_stride_;      // publish every Nth voxel per axis
+  bool full_map_updates_;        // retain data across the fixed planner box
+  bool obstacles_from_octomap_;
   bool free_from_octomap_;       // true: free space comes from octomap_full (replace), false: per-scan cloud (accumulate)
   int free_astar_stride_;        // voxels per A* step
   int free_astar_max_nodes_;     // search budget
@@ -238,6 +240,7 @@ private:
 
   void freeCloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
   void trimFreeBuffer();
+  void applyVirtualCeiling();
   void freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedPtr msg);
   void forceFreeAroundOdom();
   void publishFreeSpace();
