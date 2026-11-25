@@ -138,8 +138,19 @@ namespace ego_planner
           [this](const std::shared_ptr<nav_msgs::srv::GetPlan::Request> request,
                  std::shared_ptr<nav_msgs::srv::GetPlan::Response> response)
           {
-            previewGoal(*request, *response);
+            std::string reason, frontier_status;
+            response->plan = previewGoal(request->goal, request->tolerance, reason, frontier_status);
           });
+#ifdef NGD_GOAL_PREVIEW
+      goal_check_service_ = node_->create_service<ngd_ros_wrapper::srv::PreviewGoal>(
+          "/ego/check_goal",
+          [this](const std::shared_ptr<ngd_ros_wrapper::srv::PreviewGoal::Request> request,
+                 std::shared_ptr<ngd_ros_wrapper::srv::PreviewGoal::Response> response)
+          {
+            response->plan = previewGoal(request->goal, request->tolerance,
+                                         response->rejection_reason, response->frontier_status);
+          });
+#endif
       waypoint_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
           goal_topic,        // was "/move_base_simple/goal"
           1,
@@ -1063,60 +1074,119 @@ namespace ego_planner
     broadcast_bspline_pub_->publish(bspline);
   }
 
-  void EGOReplanFSM::previewGoal(const nav_msgs::srv::GetPlan::Request &request,
-                                 nav_msgs::srv::GetPlan::Response &response)
+  nav_msgs::msg::Path EGOReplanFSM::previewGoal(const geometry_msgs::msg::PoseStamped &goal,
+                                              double tolerance, std::string &rejection_reason,
+                                              std::string &frontier_status)
   {
     using namespace std::chrono_literals;
     auto map = planner_manager_->grid_map_;
-    if (!have_odom_ || !odom_pos_.allFinite() || request.goal.header.frame_id != "map" ||
-        !use_astar_global_ || !map->useFreeSpaceOnly())
-      return;
+    if (goal.header.frame_id != "map")
+      rejection_reason = "The goal must be in the map frame. Set RViz Fixed Frame to map.";
+    else if (!have_odom_ || !odom_pos_.allFinite())
+      rejection_reason = "Waiting for valid drone odometry.";
+    else if (!use_astar_global_ || !map->useFreeSpaceOnly())
+      rejection_reason = "Known-free-space A* is disabled in EGO Planner.";
+    else if (map->waitingForOctomap())
+      rejection_reason = "Waiting for a usable full OctoMap.";
+    else if (!map->isInMap(odom_pos_))
+      rejection_reason = "The drone's current position is outside the planner map bounds.";
+    else if (!map->isUnseen(odom_pos_) && map->getInflateOccupancy(odom_pos_) > 0)
+      rejection_reason = "The drone's current position is in occupied space or inside obstacle clearance.";
+    if (!rejection_reason.empty())
+      return {};
 
-    const auto & p = request.goal.pose.position;
+    const auto &p = goal.pose.position;
     const Eigen::Vector3d requested(p.x, p.y, p.z);
     if (!requested.allFinite())
-      return;
+    {
+      rejection_reason = "The goal coordinates must be finite.";
+      return {};
+    }
 
     const auto now = std::chrono::steady_clock::now();
     const auto deadline = now + 250ms;
     std::vector<Eigen::Vector3d> path;
-    auto reachable = [&](const Eigen::Vector3d &candidate) {
-      return std::chrono::steady_clock::now() < deadline &&
-             (candidate - odom_pos_).norm() >= 0.25 &&
-             map->searchFreePath(odom_pos_, candidate, path, true, deadline);
-    };
-    if (!reachable(requested))
+    bool search_limit_hit = false;
+    if (!map->isInMap(requested))
+      rejection_reason = "The point is outside the planner map bounds.";
+    else if (map->getOccupancy(requested) > 0)
+      rejection_reason = "The goal voxel is occupied in the map. Move the marker into free space.";
+    else if (map->isUnseen(requested))
+      rejection_reason = "The goal voxel is unscanned. Move the marker into mapped free space.";
+    else if (!map->isKnownFreePosition(requested))
+      rejection_reason = "The goal voxel is inside inflated obstacle clearance. Move the marker farther from the obstacle.";
+    else if ((requested - odom_pos_).norm() < 0.25)
+      rejection_reason = "The goal is less than 0.25 m from the drone.";
+    else if (!map->searchFreePath(odom_pos_, requested, path, true, deadline, &search_limit_hit))
+      rejection_reason = search_limit_hit ?
+          "The route search reached its time or node limit before verifying a path." :
+          "The goal voxel is free, but no connected known-free route was found from the drone.";
+
+    if (!rejection_reason.empty())
     {
-      if (!(request.tolerance > 0.f) || !frontier_centers_ ||
-          frontier_centers_->header.frame_id != "map" || now - frontier_received_ > 3s)
-        return;
-      std::vector<Eigen::Vector3d> candidates;
-      for (const auto & pose : frontier_centers_->poses)
+      if (!(tolerance > 0.0))
+        return {};
+      if (std::chrono::steady_clock::now() >= deadline)
       {
-        const auto & c = pose.position;
-        Eigen::Vector3d center(c.x, c.y, c.z);
-        if (map->isKnownFreePosition(center) && (center - requested).norm() <= request.tolerance)
+        frontier_status = "The preview time limit expired before a frontier could be checked.";
+        return {};
+      }
+      if (!frontier_centers_ || frontier_centers_->header.frame_id != "map" ||
+          now - frontier_received_ > 3s)
+      {
+        frontier_status = "No recent OctoMap frontier data is available.";
+        return {};
+      }
+
+      std::vector<Eigen::Vector3d> candidates;
+      for (const auto &pose : frontier_centers_->poses)
+      {
+        const auto &c = pose.position;
+        const Eigen::Vector3d center(c.x, c.y, c.z);
+        if (map->isKnownFreePosition(center) && (center - requested).norm() <= tolerance &&
+            (center - odom_pos_).norm() >= 0.25)
           candidates.push_back(center);
       }
-      std::sort(candidates.begin(), candidates.end(), [&](const auto & a, const auto & b) {
+      if (candidates.empty())
+      {
+        frontier_status = "No frontier center passed the known-free and minimum-distance checks.";
+        return {};
+      }
+      std::sort(candidates.begin(), candidates.end(), [&](const auto &a, const auto &b) {
         return (a - requested).squaredNorm() < (b - requested).squaredNorm();
       });
-      if (std::find_if(candidates.begin(), candidates.end(), reachable) == candidates.end())
-        return;
+      bool frontier_limit_hit = false;
+      for (const auto &candidate : candidates)
+      {
+        if (std::chrono::steady_clock::now() >= deadline)
+          break;
+        if (map->searchFreePath(odom_pos_, candidate, path, true, deadline, &search_limit_hit))
+          break;
+        frontier_limit_hit |= search_limit_hit;
+      }
+      if (path.empty())
+      {
+        frontier_status = frontier_limit_hit || std::chrono::steady_clock::now() >= deadline ?
+            "The frontier search reached its time or node limit before finding an alternative." :
+            "No frontier center was connected to the drone through known free space.";
+        return {};
+      }
     }
 
-    response.plan.header.frame_id = "map";
-    response.plan.header.stamp = node_->now();
-    for (const auto & point : path)
+    nav_msgs::msg::Path plan;
+    plan.header.frame_id = "map";
+    plan.header.stamp = node_->now();
+    for (const auto &point : path)
     {
       geometry_msgs::msg::PoseStamped waypoint;
-      waypoint.header = response.plan.header;
+      waypoint.header = plan.header;
       waypoint.pose.position.x = point.x();
       waypoint.pose.position.y = point.y();
       waypoint.pose.position.z = point.z();
       waypoint.pose.orientation.w = 1.0;
-      response.plan.poses.push_back(waypoint);
+      plan.poses.push_back(waypoint);
     }
+    return plan;
   }
 
   bool EGOReplanFSM::planGlobalRoute(const Eigen::Vector3d &goal, bool exact)

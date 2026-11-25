@@ -311,9 +311,12 @@ bool GridMap::isKnownFreePosition(const Eigen::Vector3d &pos)
 
 bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
                              std::vector<Eigen::Vector3d> &path, bool exact,
-                             std::chrono::steady_clock::time_point deadline)
+                             std::chrono::steady_clock::time_point deadline,
+                             bool *search_limit_hit)
 {
   path.clear();
+  if (search_limit_hit)
+    *search_limit_hit = false;
   if (!isInMap(start) || !isInMap(goal) || (exact && !isKnownFreePosition(goal)))
     return false;
 
@@ -381,7 +384,11 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
       continue;   // stale queue entry
     ++expanded;
     if (exact && expanded % 128 == 0 && std::chrono::steady_clock::now() >= deadline)
+    {
+      if (search_limit_hit)
+        *search_limit_hit = true;
       return false;
+    }
 
     const float hc = h(id);
     if (hc < best_h) { best_h = hc; best = cur.adr; }
@@ -423,6 +430,8 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
   }
 
   const bool reached = goal_adr >= 0;
+  if (search_limit_hit && !reached && !open.empty() && expanded >= mp_.free_astar_max_nodes_)
+    *search_limit_hit = true;
   if (exact && !reached)
     return false;
   std::vector<Eigen::Vector3d> raw;

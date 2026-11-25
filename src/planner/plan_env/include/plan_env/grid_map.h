@@ -218,10 +218,12 @@ public:
   bool useFreeSpaceOnly() { return mp_.use_free_space_only_; }
   bool isUnseen(const Eigen::Vector3d &pos);   // not seen free, not obstacle
   bool isKnownFreePosition(const Eigen::Vector3d &pos);
+  bool waitingForOctomap() const { return mp_.obstacles_from_octomap_ && !md_.has_cloud_; }
   bool searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
                       std::vector<Eigen::Vector3d> &path, bool exact = false,
                       std::chrono::steady_clock::time_point deadline =
-                        std::chrono::steady_clock::time_point::max());
+                        std::chrono::steady_clock::time_point::max(),
+                      bool *search_limit_hit = nullptr);
   typedef std::shared_ptr<GridMap> Ptr;
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
