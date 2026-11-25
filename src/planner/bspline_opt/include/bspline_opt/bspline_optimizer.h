@@ -126,7 +126,6 @@ namespace ego_planner
     inline int getOrder(void) { return order_; }
     inline double getSwarmClearance(void) { return swarm_clearance_; }
     double getCollisionCheckFraction() const { return collision_check_fraction_; }
-    bool isCompleteTrajectoryClear(UniformBspline &trajectory);
 
   private:
     GridMap::Ptr grid_map_;
@@ -196,7 +195,7 @@ namespace ego_planner
     void calcFitnessCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     bool check_collision_and_rebound(void);
     int collisionCheckEndIndex(int end) const;
-    bool firstCollision(UniformBspline &trajectory, double &time, double fraction);
+    bool firstCollision(UniformBspline &trajectory, double &time);
     double collision_check_fraction_ = 1.0;
 
     static int earlyExit(void *func_data, const double *x, const double *g, const double fx, const double xnorm, const double gnorm, const double step, int n, int k, int ls);

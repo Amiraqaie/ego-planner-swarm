@@ -37,9 +37,6 @@ namespace ego_planner
     node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
     node_->get_parameter("fsm/thresh_no_replan_meter", no_replan_thresh_);
     node_->get_parameter("fsm/planning_horizon", planning_horizen_);
-    dynamic_planning_horizon_ = node_->declare_parameter("fsm/dynamic_planning_horizon", false);
-    if (dynamic_planning_horizon_ && (!std::isfinite(planning_horizen_) || planning_horizen_ <= 0.0))
-      throw std::invalid_argument("Dynamic planning requires a positive finite fallback horizon");
     node_->get_parameter("fsm/planning_horizen_time", planning_horizen_time_);
     node_->get_parameter("fsm/emergency_time", emergency_time_);
     node_->get_parameter("fsm/realworld_experiment", flag_realworld_experiment_);
@@ -788,8 +785,7 @@ namespace ego_planner
           changeFSMExecState(WAIT_TARGET, "FSM");
           goto force_return;
         }
-        else if (!dynamic_planning_horizon_ &&
-                 (end_pt_ - pos).norm() > no_replan_thresh_ && t_cur > replan_thresh_)
+        else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_cur > replan_thresh_)
         {
           changeFSMExecState(REPLAN_TRAJ, "FSM");
         }
@@ -844,9 +840,6 @@ namespace ego_planner
     else
       flag_random_poly_init = true;
 
-    if (dynamic_planning_horizon_)
-      return callReboundReplan(true, false);
-
     for (int i = 0; i < trial_times; i++)
     {
       if (callReboundReplan(true, flag_random_poly_init))
@@ -869,9 +862,6 @@ namespace ego_planner
     start_pt_ = info->position_traj_.evaluateDeBoorT(t_cur);
     start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
     start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
-
-    if (dynamic_planning_horizon_)
-      return callReboundReplan(false, false);
 
     bool success = callReboundReplan(false, false);
 
@@ -990,18 +980,10 @@ namespace ego_planner
   bool EGOReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
   {
 
-    bool plan_and_refine_success;
-    if (dynamic_planning_horizon_)
-    {
-      plan_and_refine_success = planDynamicTrajectory();
-    }
-    else
-    {
-      getLocalTarget();
-      plan_and_refine_success = planner_manager_->reboundReplan(
-          start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_,
-          have_new_target_ || flag_use_poly_init, flag_randomPolyTraj);
-    }
+    getLocalTarget();
+
+    bool plan_and_refine_success =
+        planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj);
     have_new_target_ = false;
 
     cout << "refine_success=" << plan_and_refine_success << endl;
@@ -1266,7 +1248,6 @@ namespace ego_planner
                 odom_pos_, odom_vel_, Eigen::Vector3d::Zero(),
                 wps, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()))
         {
-          setReferenceRoute(path);
           RCLCPP_INFO(node_->get_logger(), "Free-space A* route: %zu waypoints", wps.size());
           return true;
         }
@@ -1275,100 +1256,9 @@ namespace ego_planner
         return false;
       RCLCPP_WARN(node_->get_logger(), "Free-space A* failed, using straight line");
     }
-    const bool planned = planner_manager_->planGlobalTraj(
+    return planner_manager_->planGlobalTraj(
         odom_pos_, odom_vel_, Eigen::Vector3d::Zero(),
         goal, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
-    if (planned)
-      setReferenceRoute({odom_pos_, goal});
-    return planned;
-  }
-
-  void EGOReplanFSM::setReferenceRoute(const std::vector<Eigen::Vector3d> &route)
-  {
-    if (!dynamic_planning_horizon_)
-      return;
-    reference_route_ = route;
-    reference_segment_ = 0;
-    failed_full_start_.reset();
-  }
-
-  bool EGOReplanFSM::planDynamicTrajectory()
-  {
-    if (reference_route_.size() < 2)
-      return false;
-
-    // Start at the closest point on the remaining route. Progress only advances
-    // after a successful plan so a rejected candidate cannot skip waypoints.
-    size_t segment = reference_segment_;
-    Eigen::Vector3d nearest = reference_route_[segment];
-    double best_distance = std::numeric_limits<double>::infinity();
-    for (size_t i = segment; i + 1 < reference_route_.size(); ++i)
-    {
-      const Eigen::Vector3d &a = reference_route_[i];
-      const Eigen::Vector3d edge = reference_route_[i + 1] - a;
-      if (edge.squaredNorm() < 1e-12)
-        continue;
-      const double u = std::clamp((start_pt_ - a).dot(edge) / edge.squaredNorm(), 0.0, 1.0);
-      const Eigen::Vector3d point = a + u * edge;
-      const double distance = (point - start_pt_).squaredNorm();
-      if (distance < best_distance)
-      {
-        best_distance = distance;
-        nearest = point;
-        segment = i;
-      }
-    }
-
-    std::vector<Eigen::Vector3d> remaining{start_pt_, nearest};
-    remaining.insert(remaining.end(), reference_route_.begin() + segment + 1, reference_route_.end());
-    auto map = planner_manager_->grid_map_;
-    const auto now = std::chrono::steady_clock::now();
-    const bool try_full = !failed_full_start_ || (start_pt_ - *failed_full_start_).norm() >= 0.5 ||
-        now - failed_full_time_ >= std::chrono::seconds(2);
-    const double full = std::numeric_limits<double>::infinity();
-    const double first_limit = try_full ? full : planning_horizen_;
-    const double min_target_distance = 0.2;
-    double previous_length = -1.0;
-    for (const double limit : {first_limit, planning_horizen_, planning_horizen_ * 0.5, planning_horizen_ * 0.25})
-    {
-      std::vector<Eigen::Vector3d> seed{start_pt_};
-      double length = 0.0;
-      for (size_t i = 1; i < remaining.size() && length < limit; ++i)
-      {
-        const Eigen::Vector3d edge = remaining[i] - remaining[i - 1];
-        const double edge_length = edge.norm();
-        if (edge_length <= 1e-6)
-          continue;
-        const double take = std::min(edge_length, limit - length);
-        seed.push_back(remaining[i - 1] + (take / edge_length) * edge);
-        length += take;
-      }
-
-      const bool complete = (seed.back() - end_pt_).norm() < 1e-6;
-      if (std::abs(length - previous_length) < 1e-6 || (!try_full && complete))
-        continue;
-      previous_length = length;
-      if ((seed.back() - start_pt_).norm() >= min_target_distance &&
-          map->getInflateOccupancy(seed.back()) == 0 &&
-          planner_manager_->reboundReplan(
-              start_pt_, start_vel_, start_acc_, seed.back(), Eigen::Vector3d::Zero(), true, false, seed))
-      {
-        local_target_pt_ = seed.back();
-        local_target_vel_.setZero();
-        reference_segment_ = segment;
-        if (complete)
-          failed_full_start_.reset();
-        RCLCPP_INFO(node_->get_logger(), "Dynamic horizon: optimized %s (%.2f m reference)",
-                    complete ? "complete route to goal" : "shorter route segment", length);
-        return true;
-      }
-      if (complete)
-      {
-        failed_full_start_ = start_pt_;
-        failed_full_time_ = now;
-      }
-    }
-    return false;
   }
 
   bool EGOReplanFSM::globalPathBlocked()
