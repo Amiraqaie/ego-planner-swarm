@@ -354,9 +354,19 @@ namespace ego_planner
                 "New goal (%.2f, %.2f, %.2f) [z %s]", gx, gy, goal_z,
                 z_given ? "from goal" : "= current UAV height");
 
+    const auto map = planner_manager_->grid_map_;
+    const bool exact = explicit_z && use_astar_global_ && map->useFreeSpaceOnly();
+    if (explicit_z && !exact)
+    {
+      std::string reason, frontier_status;
+      if (previewGoal(*msg, 0.0, reason, frontier_status).poses.empty())
+      {
+        RCLCPP_WARN(node_->get_logger(), "3D goal rejected: %s", reason.c_str());
+        return;
+      }
+    }
     px4_offboard_.poll();
     init_pt_ = odom_pos_;
-    const bool exact = explicit_z && use_astar_global_ && planner_manager_->grid_map_->useFreeSpaceOnly();
     planNextWaypoint(end_wp, true, exact);
   }
 
@@ -1080,17 +1090,18 @@ namespace ego_planner
   {
     using namespace std::chrono_literals;
     auto map = planner_manager_->grid_map_;
+    const bool known_free_only = map->useFreeSpaceOnly();
+    const bool global_astar = use_astar_global_ && known_free_only;
     if (goal.header.frame_id != "map")
       rejection_reason = "The goal must be in the map frame. Set RViz Fixed Frame to map.";
     else if (!have_odom_ || !odom_pos_.allFinite())
       rejection_reason = "Waiting for valid drone odometry.";
-    else if (!use_astar_global_ || !map->useFreeSpaceOnly())
-      rejection_reason = "Known-free-space A* is disabled in EGO Planner.";
     else if (map->waitingForOctomap())
       rejection_reason = "Waiting for a usable full OctoMap.";
     else if (!map->isInMap(odom_pos_))
       rejection_reason = "The drone's current position is outside the planner map bounds.";
-    else if (!map->isUnseen(odom_pos_) && map->getInflateOccupancy(odom_pos_) > 0)
+    else if (map->getInflateOccupancy(odom_pos_) > 0 &&
+             (!known_free_only || !map->isUnseen(odom_pos_)))
       rejection_reason = "The drone's current position is in occupied space or inside obstacle clearance.";
     if (!rejection_reason.empty())
       return {};
@@ -1111,16 +1122,25 @@ namespace ego_planner
       rejection_reason = "The point is outside the planner map bounds.";
     else if (map->getOccupancy(requested) > 0)
       rejection_reason = "The goal voxel is occupied in the map. Move the marker into free space.";
-    else if (map->isUnseen(requested))
+    else if (known_free_only ? map->isUnseen(requested) : map->isUnknown(requested))
       rejection_reason = "The goal voxel is unscanned. Move the marker into mapped free space.";
-    else if (!map->isKnownFreePosition(requested))
+    else if (map->getInflateOccupancy(requested) > 0)
       rejection_reason = "The goal voxel is inside inflated obstacle clearance. Move the marker farther from the obstacle.";
     else if ((requested - odom_pos_).norm() < 0.25)
       rejection_reason = "The goal is less than 0.25 m from the drone.";
-    else if (!map->searchFreePath(odom_pos_, requested, path, true, deadline, &search_limit_hit))
+    else if (global_astar && !map->searchFreePath(odom_pos_, requested, path, true, deadline, &search_limit_hit))
       rejection_reason = search_limit_hit ?
           "The route search reached its time or node limit before verifying a path." :
           "The goal voxel is free, but no connected known-free route was found from the drone.";
+
+    if (!global_astar)
+    {
+      if (!rejection_reason.empty())
+        return {};
+      // A single pose confirms the destination alone. There is no global route
+      // or verified frontier alternative in local planning mode.
+      path.push_back(requested);
+    }
 
     if (!rejection_reason.empty())
     {
