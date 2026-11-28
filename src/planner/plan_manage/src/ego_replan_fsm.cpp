@@ -28,6 +28,7 @@ namespace ego_planner
     const auto goal_3d_topic = node_->declare_parameter<std::string>("fsm/goal_3d_topic", "/ego/goal_pose_3d");
     node_->declare_parameter("fsm/goal_z_valid_min", 0.1);
     node_->declare_parameter("fsm/use_astar_global", false);
+    node_->declare_parameter("fsm/goal_preview_timeout_ms", 1000);
     std::string goal_topic;
 
     node_->get_parameter("fsm/use_astar_global", use_astar_global_);
@@ -1115,7 +1116,8 @@ namespace ego_planner
     }
 
     const auto now = std::chrono::steady_clock::now();
-    const auto deadline = now + 250ms;
+    const auto timeout = node_->get_parameter("fsm/goal_preview_timeout_ms").as_int();
+    const auto deadline = now + std::chrono::milliseconds(std::max<int64_t>(1, timeout));
     std::vector<Eigen::Vector3d> path;
     bool search_limit_hit = false;
     if (!map->isInMap(requested))
