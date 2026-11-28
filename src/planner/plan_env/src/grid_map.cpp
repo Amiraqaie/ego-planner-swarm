@@ -255,6 +255,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
         "grid_map/occupancy_inflate_drone_cube", 1);
     node_->declare_parameter("grid_map/ceiling_display_margin", 0.30);
     node_->declare_parameter("grid_map/hide_lower_floors", false);
+    node_->declare_parameter("grid_map/nominal_floor_height", 3.0);
     ceiling_height_pub_ = node_->create_publisher<std_msgs::msg::Float64>(
         "grid_map/detected_ceiling_height", rclcpp::QoS(1).transient_local());
   }
@@ -1726,7 +1727,10 @@ std::optional<double> GridMap::findDisplaySlab(const Eigen::Vector3d &position, 
   Eigen::Vector3i drone;
   posToIndex(position, drone);
   const int spacing = std::max(1, static_cast<int>(std::round(0.35 / mp_.resolution_)));
-  const int first = drone.z() + direction * std::max(1, static_cast<int>(std::ceil(0.25 / mp_.resolution_)));
+  // A downward probe starts just below the drone so it can see a thin
+  // slab even when the drone is close to the floor.
+  const int offset = ceiling ? std::max(1, static_cast<int>(std::ceil(0.25 / mp_.resolution_))) : 1;
+  const int first = drone.z() + direction * offset;
   const int range = static_cast<int>(4.0 / mp_.resolution_);
   std::vector<int> hits;
   for (int dx = -2; dx <= 2; ++dx)
@@ -1899,8 +1903,22 @@ void GridMap::publishMapInflate(bool all_info)
     cutoff = *ceiling_height_ - margin;
   }
 
-  const double lower_cutoff = hide_lower && floor_height_
-      ? *floor_height_ - mp_.resolution_ : -std::numeric_limits<double>::infinity();
+  double lower_cutoff = -std::numeric_limits<double>::infinity();
+  if (hide_lower)
+  {
+    if (floor_height_)
+      lower_cutoff = *floor_height_ - mp_.resolution_;
+    else if (ceiling_height_)
+    {
+      // After a restart the ceiling can be confirmed before the floor.
+      // Use a provisional band instead of showing every lower level.
+      const double nominal = node_->get_parameter("grid_map/nominal_floor_height").as_double();
+      const double room_height = confirmed_room_height_.value_or(
+          std::isfinite(nominal) && nominal >= 0.8 ? nominal : 3.0);
+      lower_cutoff = std::min(*ceiling_height_ - room_height - mp_.resolution_,
+                             md_.camera_pos_.z() - mp_.resolution_);
+    }
+  }
 
   Eigen::Vector3i min_cut = md_.local_bound_min_;
   Eigen::Vector3i max_cut = md_.local_bound_max_;
