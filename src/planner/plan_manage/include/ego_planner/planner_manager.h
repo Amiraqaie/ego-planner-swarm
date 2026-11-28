@@ -29,7 +29,7 @@ namespace ego_planner
 
     /* main planning interface */
     bool reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel, Eigen::Vector3d start_acc,
-                       Eigen::Vector3d end_pt, Eigen::Vector3d end_vel, bool flag_polyInit, bool flag_randomPolyTraj);
+                       Eigen::Vector3d end_pt, Eigen::Vector3d end_vel, bool flag_polyInit, bool flag_randomPolyTraj, bool allow_route_seed = true);
     bool EmergencyStop(Eigen::Vector3d stop_pos);
     bool planGlobalTraj(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                         const Eigen::Vector3d &end_pos, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
@@ -47,7 +47,6 @@ namespace ego_planner
 
     double getCollisionCheckFraction() const { return bspline_optimizer_->getCollisionCheckFraction(); }
     bool checkCollision(int drone_id);
-    void setReplanInterval(double interval) { replan_interval_ = interval; }
     
 
     PlanParameters pp_;
@@ -66,15 +65,10 @@ namespace ego_planner
     BsplineOptimizer::Ptr bspline_optimizer_;
 
     int continous_failures_count_{0};
-    double replan_interval_ = 1.0;
-    rclcpp::Clock diagnostic_clock_{RCL_STEADY_TIME};
 
     bool validateGlobalPolynomial(PolynomialTraj &trajectory, const Eigen::Vector3d &start);
-    bool initializeFromReference(const Eigen::Vector3d &start, const Eigen::Vector3d &end,
-                                 const Eigen::Vector3d &velocity, const Eigen::Vector3d &acceleration,
-                                 bool reuse_previous,
-                                 double &ts, vector<Eigen::Vector3d> &samples,
-                                 vector<Eigen::Vector3d> &derivatives, Eigen::MatrixXd &control_points);
+    bool sampleGridRoute(const Eigen::Vector3d &start, const Eigen::Vector3d &end,
+                         vector<Eigen::Vector3d> &samples);
 
     void updateTrajInfo(const UniformBspline &position_traj, const rclcpp::Time time_now);
 

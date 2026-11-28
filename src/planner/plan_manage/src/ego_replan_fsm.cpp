@@ -64,7 +64,6 @@ namespace ego_planner
     planner_manager_.reset(new EGOPlannerManager);
 
     planner_manager_->initPlanModules(node_, visualization_);
-    planner_manager_->setReplanInterval(replan_thresh_);
 
     planner_manager_->deliverTrajToOptimizer(); // store trajectories
     planner_manager_->setDroneIdtoOpt();
@@ -254,7 +253,6 @@ namespace ego_planner
 
       // Internal preset waypoint advances share the original goal identity.
       const bool new_goal = restart || exec_state_ == WAIT_TARGET || exec_state_ == INIT;
-    new_goal_progress_ = new_goal;
       if (new_goal)
       {
         auto &last_traj_id = planner_manager_->local_data_.traj_id_;
@@ -789,12 +787,12 @@ namespace ego_planner
         }
         else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_cur > replan_thresh_)
         {
-          changeFSMExecState(REPLAN_TRAJ, "PERIODIC");
+          changeFSMExecState(REPLAN_TRAJ, "FSM");
         }
       }
       else if (t_cur > replan_thresh_)
       {
-        changeFSMExecState(REPLAN_TRAJ, "PERIODIC");
+        changeFSMExecState(REPLAN_TRAJ, "FSM");
       }
 
       break;
@@ -836,9 +834,6 @@ namespace ego_planner
     start_vel_ = odom_vel_;
     start_acc_.setZero();
 
-    if (planner_manager_->global_data_.hasGridRoute())
-      return callReboundReplan(true, false);
-
     bool flag_random_poly_init;
     if (timesOfConsecutiveStateCalls().first == 1)
       flag_random_poly_init = false;
@@ -863,26 +858,10 @@ namespace ego_planner
     auto time_now = rclcpp::Clock().now();
     // double t_cur = (time_now - info->start_time_).toSec();
     double t_cur = (time_now - info->start_time_).seconds();
-    const bool has_route = planner_manager_->global_data_.hasGridRoute();
-    const bool holding = has_route && t_cur >= info->duration_;
-    if (has_route)
-      t_cur = std::clamp(t_cur, 0.0, info->duration_);
 
     start_pt_ = info->position_traj_.evaluateDeBoorT(t_cur);
     start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
     start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
-    if (holding)
-    {
-      start_vel_.setZero();
-      start_acc_.setZero();
-    }
-
-    if (has_route)
-    {
-      if (callReboundReplan(false, false))
-        return true;
-      return callReboundReplan(true, false);
-    }
 
     bool success = callReboundReplan(false, false);
 
@@ -1006,13 +985,6 @@ namespace ego_planner
     bool plan_and_refine_success =
         planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj);
     have_new_target_ = false;
-    auto &reference = planner_manager_->global_data_;
-    if (plan_and_refine_success && reference.hasGridRoute() &&
-        reference.local_reference_start_ > reference.last_progress_time_)
-    {
-      reference.last_progress_time_ = reference.local_reference_start_;
-      reference.progress_position_ = odom_pos_;
-    }
 
     cout << "refine_success=" << plan_and_refine_success << endl;
 
@@ -1020,16 +992,6 @@ namespace ego_planner
     {
 
       auto info = &planner_manager_->local_data_;
-      const auto now = std::chrono::steady_clock::now();
-      if (last_progress_log_.time_since_epoch().count() && !new_goal_progress_)
-        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
-            "Progress since previous plan over %.2fs: commanded %.3fm, measured %.3fm",
-            std::chrono::duration<double>(now - last_progress_log_).count(),
-            (start_pt_ - last_command_start_).norm(), (odom_pos_ - last_measured_start_).norm());
-      last_progress_log_ = now;
-      last_command_start_ = info->start_pos_;
-      last_measured_start_ = odom_pos_;
-      new_goal_progress_ = false;
 
       traj_utils::msg::Bspline bspline;
       bspline.order = 3;
@@ -1353,66 +1315,14 @@ namespace ego_planner
 
   void EGOReplanFSM::getLocalTarget()
   {
-    auto &reference = planner_manager_->global_data_;
-    if (reference.hasGridRoute())
-    {
-      // Project only onto a forward neighborhood reachable since the last
-      // accepted projection, then stop at the first distance minimum.
-      const double step = std::min(0.05, planning_horizen_ / (20 * planner_manager_->pp_.max_vel_));
-      const double moved = (odom_pos_ - reference.progress_position_).norm();
-      const double resolution = planner_manager_->grid_map_->getResolution();
-      double progress = reference.last_progress_time_;
-      Eigen::Vector3d previous = reference.referencePosition(progress);
-      double best = (odom_pos_ - previous).squaredNorm();
-      double arc = 0.0;
-      for (double t = progress; moved > 0.01 && t < reference.global_duration_;)
-      {
-        t = std::min(t + step, reference.global_duration_);
-        const Eigen::Vector3d point = reference.referencePosition(t);
-        arc += (point - previous).norm();
-        if (arc > 1.5 * moved + resolution)
-          break;
-        const double distance = (odom_pos_ - point).squaredNorm();
-        if (distance > best + 1e-8)
-          break;
-        if (distance < best)
-        {
-          progress = t;
-          best = distance;
-        }
-        previous = point;
-      }
-
-      auto map = planner_manager_->grid_map_;
-      double target = progress;
-      double last_free = progress;
-      while (target < reference.global_duration_)
-      {
-        target = std::min(target + step, reference.global_duration_);
-        const Eigen::Vector3d point = reference.referencePosition(target);
-        if (map->getInflateOccupancy(point) == 0)
-          last_free = target;
-        if ((point - start_pt_).norm() >= planning_horizen_)
-          break;
-      }
-      target = last_free;
-      reference.local_reference_start_ = progress;
-      reference.local_reference_end_ = target;
-      local_target_pt_ = reference.referencePosition(target);
-      local_target_vel_ = reference.referenceVelocity(target);
-      const double speed = local_target_vel_.norm();
-      if (speed > planner_manager_->pp_.max_vel_)
-        local_target_vel_ *= planner_manager_->pp_.max_vel_ / speed;
-      return;
-    }
-
+    auto &route = planner_manager_->global_data_;
     double t;
 
     double t_step = planning_horizen_ / 20 / planner_manager_->pp_.max_vel_;
-    double dist_min = 9999, dist_min_t = 0.0;
+    double dist_min = 9999, dist_min_t = route.last_progress_time_;
     for (t = planner_manager_->global_data_.last_progress_time_; t < planner_manager_->global_data_.global_duration_; t += t_step)
     {
-      Eigen::Vector3d pos_t = planner_manager_->global_data_.getPosition(t);
+      Eigen::Vector3d pos_t = route.referencePosition(t);
       double dist = (pos_t - start_pt_).norm();
 
       if (t < planner_manager_->global_data_.last_progress_time_ + 1e-5 && dist > planning_horizen_)
@@ -1420,7 +1330,7 @@ namespace ego_planner
         // Important cornor case!
         for (; t < planner_manager_->global_data_.global_duration_; t += t_step)
         {
-          Eigen::Vector3d pos_t_temp = planner_manager_->global_data_.getPosition(t);
+          Eigen::Vector3d pos_t_temp = route.referencePosition(t);
           double dist_temp = (pos_t_temp - start_pt_).norm();
           if (dist_temp < planning_horizen_)
           {
@@ -1445,10 +1355,10 @@ namespace ego_planner
         break;
       }
     }
-    if (t > planner_manager_->global_data_.global_duration_) // Last global point
+    if (t >= planner_manager_->global_data_.global_duration_) // Last global point
     {
-      local_target_pt_ = end_pt_;
-      planner_manager_->global_data_.last_progress_time_ = planner_manager_->global_data_.global_duration_;
+      local_target_pt_ = route.hasGridRoute() ? route.referencePosition(route.global_duration_) : end_pt_;
+      route.last_progress_time_ = dist_min_t;
     }
 
     if ((end_pt_ - local_target_pt_).norm() < (planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_) / (2 * planner_manager_->pp_.max_acc_))
@@ -1457,8 +1367,11 @@ namespace ego_planner
     }
     else
     {
-      local_target_vel_ = planner_manager_->global_data_.getVelocity(t);
+      local_target_vel_ = route.referenceVelocity(std::min(t, route.global_duration_));
     }
+
+    route.local_reference_start_ = dist_min_t;
+    route.local_reference_end_ = std::min(t, route.global_duration_);
 
     // free-space-only: pull the local target back only if it is in UNSEEN space
     auto map = planner_manager_->grid_map_;

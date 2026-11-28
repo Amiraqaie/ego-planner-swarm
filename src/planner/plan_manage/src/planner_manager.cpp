@@ -1,6 +1,5 @@
 // #include <fstream>
 #include <ego_planner/planner_manager.h>
-#include <ego_planner/local_arc_timing.h>
 #include <thread>
 #include "visualization_msgs/msg/marker.hpp" // zx-todo
 
@@ -32,7 +31,6 @@ namespace ego_planner
     node->get_parameter("manager/drone_id", pp_.drone_id);
 
     local_data_.traj_id_ = 0;
-    local_data_.duration_ = 0.0;
     grid_map_.reset(new GridMap);
     // grid_map_->initMap(nh);
     grid_map_->initMap(node);
@@ -46,154 +44,55 @@ namespace ego_planner
     visualization_ = vis;
   }
 
-  namespace
+  bool EGOPlannerManager::sampleGridRoute(const Eigen::Vector3d &start, const Eigen::Vector3d &end,
+                                          vector<Eigen::Vector3d> &samples)
   {
-    void setSplineBoundary(Eigen::MatrixXd &points, int center, double interval,
-                           const Eigen::Vector3d &position, const Eigen::Vector3d &velocity,
-                           const Eigen::Vector3d &acceleration)
-    {
-      const Eigen::Vector3d delta = interval * velocity;
-      const Eigen::Vector3d curvature = interval * interval * acceleration / 6.0;
-      points.col(center - 1) = position - delta + 2.0 * curvature;
-      points.col(center) = position - curvature;
-      points.col(center + 1) = position + delta + 2.0 * curvature;
-    }
-  }
-
-  bool EGOPlannerManager::initializeFromReference(
-      const Eigen::Vector3d &start, const Eigen::Vector3d &end,
-      const Eigen::Vector3d &velocity, const Eigen::Vector3d &acceleration,
-      bool reuse_previous, double &ts,
-      vector<Eigen::Vector3d> &samples, vector<Eigen::Vector3d> &derivatives, Eigen::MatrixXd &control_points)
-  {
-    auto &reference = global_data_;
-    const double begin = reference.local_reference_start_;
-    const double finish = reference.local_reference_end_;
-    const double global_duration = finish - begin;
-    if (!std::isfinite(global_duration) || global_duration <= 1e-6)
+    auto &route = global_data_;
+    const double begin = route.local_reference_start_;
+    const double finish = route.local_reference_end_;
+    if (!route.hasGridRoute() || finish <= begin || samples.size() < 2)
       return false;
 
-    // Use normalized subdivision so a uniformly time-scaled reference yields
-    // the same spatial polyline. Include the raw route knots at sharp turns.
-    vector<double> times{begin};
-    for (int i = 1; i < 512; ++i)
-      times.push_back(begin + global_duration * i / 512);
-    for (double t : reference.raw_times_)
-      if (t > begin && t < finish)
-        times.push_back(t);
-    times.push_back(finish);
-    std::sort(times.begin(), times.end());
-    vector<double> arc{0.0}, parameters{begin};
-    vector<Eigen::Vector3d> geometry{start};
-    for (double t : times)
-    {
-      const Eigen::Vector3d point = t == finish ? end : reference.referencePosition(t);
-      const double step = (point - geometry.back()).norm();
-      if (!std::isfinite(step))
-        return false;
-      if (step <= 1e-8)
-        continue;
-      arc.push_back(arc.back() + step);
-      geometry.push_back(point);
-      parameters.push_back(t);
-    }
-    if (arc.back() < 1e-6)
-      return false;
-
-    const Eigen::Vector3d tangent = (geometry.back() - geometry[geometry.size() - 2]).normalized();
-    const Eigen::Vector3d initial_tangent = (geometry[1] - start).normalized();
-    const double initial_speed = std::max(0.0, velocity.dot(initial_tangent));
-    const double reserve = std::clamp(1.0 - pp_.feasibility_tolerance_, 0.8, 0.98);
-    const double max_speed = pp_.max_vel_ * reserve;
-    const bool intermediate = finish < reference.global_duration_ - 1e-6;
-    const double terminal_speed = intermediate ? max_speed * 0.7 : 0.0;
-    const double acceleration_budget = pp_.max_acc_ * reserve *
-        (0.6 - 0.2 * std::clamp(acceleration.norm() / pp_.max_acc_, 0.0, 1.0));
-    const LocalArcTiming timing(arc.back(), max_speed, acceleration_budget, initial_speed, terminal_speed);
-    const double duration = timing.duration();
-    const double count = std::ceil(std::max(arc.back() / pp_.ctrl_pt_dist,
-                                            duration * max_speed / pp_.ctrl_pt_dist));
-    if (!std::isfinite(count) || count > 256)
-      return false;
-    const int intervals = std::max(6, static_cast<int>(count));
-    ts = duration / intervals;
-    auto &guide_times = reference.local_knot_reference_times_;
-    guide_times.clear();
-    samples.reserve(intervals + 1);
-    size_t j = 1;
-    for (int i = 0; i <= intervals; ++i)
-    {
-      const double distance = timing.distanceAt(i == intervals ? duration : i * ts);
-      while (j + 1 < arc.size() && arc[j] < distance)
-        ++j;
-      const double u = (distance - arc[j - 1]) / (arc[j] - arc[j - 1]);
-      samples.push_back(geometry[j - 1] + u * (geometry[j] - geometry[j - 1]));
-      guide_times.push_back(parameters[j - 1] + u * (parameters[j] - parameters[j - 1]));
-    }
-    guide_times.back() = finish;
-
-    vector<Eigen::Vector3d> seed = samples;
-    const Eigen::Vector3d local_end_velocity = timing.end_speed * tangent;
-    // The local terminal tangent is held with zero longitudinal acceleration.
-    const Eigen::Vector3d end_acceleration = Eigen::Vector3d::Zero();
-    derivatives = {velocity, local_end_velocity, acceleration, end_acceleration};
-    RCLCPP_INFO_THROTTLE(rclcpp::get_logger("ego_planner.timing"), diagnostic_clock_, 1000,
-        "Reference %.2fs, arc %.2fm, local %.2fs, controls %d, knot %.3fs, v0=(%.3f,%.3f,%.3f), "
-        "v1=(%.3f,%.3f,%.3f)", global_duration, arc.back(), duration, intervals + 3, ts,
-        velocity.x(), velocity.y(), velocity.z(),
-        local_end_velocity.x(), local_end_velocity.y(), local_end_velocity.z());
-
-    auto fit = [&](const vector<Eigen::Vector3d> &positions, Eigen::MatrixXd &points) {
-      UniformBspline::parameterizeToBspline(ts, positions, derivatives, points);
-      // The original least-squares parameterization uses soft boundary rows.
-      // Enforce the state exactly on the three uniform cubic endpoint controls.
-      setSplineBoundary(points, 1, ts, start, velocity, acceleration);
-      setSplineBoundary(points, points.cols() - 2, ts, end, local_end_velocity, end_acceleration);
+    vector<Eigen::Vector3d> points{start};
+    vector<double> arc{0.0}, times{begin};
+    auto append = [&](const Eigen::Vector3d &point, double time) {
+      const double distance = (point - points.back()).norm();
+      if (distance > 1e-8)
+      {
+        points.push_back(point);
+        times.push_back(time);
+        arc.push_back(arc.back() + distance);
+      }
     };
-    fit(seed, control_points);
-    if (!control_points.allFinite())
+    for (size_t i = route.rawEdge(begin); i < route.raw_times_.size() && route.raw_times_[i] < finish; ++i)
+      append(route.raw_route_[i], route.raw_times_[i]);
+    append(end, finish);
+    if (points.size() < 2 || !std::isfinite(arc.back()))
       return false;
 
-    const double elapsed = (rclcpp::Clock().now() - local_data_.start_time_).seconds();
-    const double overlap = reuse_previous ? std::min({local_data_.duration_ - elapsed, duration, 4.0 * ts}) : 0.0;
-    if (reuse_previous && elapsed >= 0.0 && overlap >= 3.0 * ts)
+    // Preserve the original sample count and knot interval. The route
+    // contributes positions only, with uniform spatial spacing.
+    auto &mapping = route.local_knot_reference_times_;
+    mapping.assign(samples.size(), begin);
+    size_t edge = 1;
+    for (size_t i = 1; i + 1 < samples.size(); ++i)
     {
-      for (int i = 1; i < intervals && i * ts < overlap; ++i)
-      {
-        const double u = i * ts / overlap;
-        const double weight = 1.0 - u * u * (3.0 - 2.0 * u);
-        seed[i] = weight * local_data_.position_traj_.evaluateDeBoorT(elapsed + i * ts) +
-                  (1.0 - weight) * seed[i];
-      }
-      Eigen::MatrixXd candidate;
-      fit(seed, candidate);
-      if (candidate.allFinite())
-      {
-        UniformBspline previous_seed(candidate, 3, ts);
-        UniformBspline reference_seed(control_points, 3, ts);
-        auto smoothness = [](const Eigen::MatrixXd &points) {
-          double cost = 0.0;
-          for (int j = 3; j < points.cols(); ++j)
-            cost += (points.col(j) - 3.0 * points.col(j - 1) +
-                     3.0 * points.col(j - 2) - points.col(j - 3)).squaredNorm();
-          return cost;
-        };
-        const double prefix = std::min(1.0, duration);
-        const Eigen::Vector3d advance = reference_seed.evaluateDeBoorT(prefix) - start;
-        const bool keeps_progress = (previous_seed.evaluateDeBoorT(prefix) - start).dot(advance)
-                                    >= 0.8 * advance.squaredNorm();
-        if (keeps_progress && !bspline_optimizer_->trajectoryInCollision(previous_seed) &&
-            (bspline_optimizer_->trajectoryInCollision(reference_seed) ||
-             smoothness(candidate) < smoothness(control_points)))
-          control_points = std::move(candidate);
-      }
+      const double distance = arc.back() * i / (samples.size() - 1);
+      while (edge + 1 < arc.size() && arc[edge] < distance)
+        ++edge;
+      const double u = (distance - arc[edge - 1]) / (arc[edge] - arc[edge - 1]);
+      samples[i] = (1.0 - u) * points[edge - 1] + u * points[edge];
+      mapping[i] = (1.0 - u) * times[edge - 1] + u * times[edge];
     }
+    samples.front() = start;
+    samples.back() = end;
+    mapping.back() = finish;
     return true;
   }
 
   bool EGOPlannerManager::reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
-                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
+                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj, bool allow_route_seed)
   {
     static int count = 0;
     printf("\033[47;30m\n[drone %d replan %d]==============================================\033[0m\n", pp_.drone_id, count++);
@@ -217,27 +116,18 @@ namespace ego_planner
     vector<Eigen::Vector3d> point_set, start_end_derivatives;
     static bool flag_first_call = true, flag_force_polynomial = false;
     bool flag_regenerate = false;
-    Eigen::MatrixXd ctrl_pts, ctrl_pts_temp;
-    vector<Eigen::Vector3d> reference_samples;
-    const bool from_reference = global_data_.hasGridRoute();
-    if (from_reference)
-    {
-      if (!initializeFromReference(start_pt, local_target_pt, start_vel, start_acc,
-                                   !flag_polyInit, ts, reference_samples, start_end_derivatives, ctrl_pts))
-      {
-        ++continous_failures_count_;
-        return false;
-      }
-    }
-    else do
+    bool polynomial_seed = false;
+    do
     {
       point_set.clear();
       start_end_derivatives.clear();
       flag_regenerate = false;
+      polynomial_seed = false;
 
       // 这里如果正常进入if（通常为初次生成），则do部分只进行一次，即只清空一次点集；若进入else则有可能对异常情况重置flag_regenerate并再do一次
       if (flag_first_call || flag_polyInit || flag_force_polynomial /*|| ( start_pt - local_target_pt ).norm() < 1.0*/) // Initial path generated from a min-snap traj by order.
       {
+        polynomial_seed = true;
         flag_first_call = false;
         flag_force_polynomial = false;
         // 用于存储生成的轨迹
@@ -375,35 +265,18 @@ namespace ego_planner
     } while (flag_regenerate);
 
     // 将轨迹变为B样条轨迹
-    if (!from_reference)
-      UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
+    global_data_.local_knot_reference_times_.clear();
+    const bool route_seed = allow_route_seed && polynomial_seed && sampleGridRoute(start_pt, local_target_pt, point_set);
+    Eigen::MatrixXd ctrl_pts, ctrl_pts_temp;
+    UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
 
-    UniformBspline initial_spline(ctrl_pts, 3, ts);
+    vector<std::pair<int, int>> segments;
     bspline_optimizer_->beginReplan(global_data_, ts);
-    const auto segments = bspline_optimizer_->initControlPoints(ctrl_pts, true);
+    segments = bspline_optimizer_->initControlPoints(ctrl_pts, true);
     // 计算时间差并更新时间
     auto now = rclcpp::Clock().now();
     t_init = now - t_start;
     t_start = now;
-
-    auto report = [&](bool success) {
-      const double total_ms = 1000.0 * ((rclcpp::Clock().now() - now) + t_init).seconds();
-      const auto &diagnostics = bspline_optimizer_->replanDiagnostics();
-      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("ego_planner.replan"), diagnostic_clock_, 1000,
-          "Local replan %s: A* attempts=%u success=%u failure=%u, global guide attempts=%u success=%u, "
-          "initial spline collision=%u, init=%.2f ms, local A*=%.2f ms, optimize=%.2f ms, total=%.2f ms",
-          success ? "accepted" : "failed", diagnostics.local_attempts, diagnostics.local_successes,
-          diagnostics.local_failures, diagnostics.reuse_attempts, diagnostics.reuse_successes,
-          diagnostics.initial_collisions, 1000.0 * t_init.seconds(), diagnostics.local_search_ms,
-          1000.0 * t_opt.seconds(), total_ms);
-      vector<Eigen::Vector3d> initial_samples;
-      const double duration = initial_spline.getTimeSum();
-      if (std::isfinite(duration) && duration >= 0.0)
-        for (int i = 0; i <= 100; ++i)
-          initial_samples.push_back(initial_spline.evaluateDeBoorT(duration * i / 100));
-      visualization_->displayReplanDebug(reference_samples, initial_samples, initial_spline.getControlPoint(),
-                                         diagnostics.reused_guides, diagnostics.local_guides);
-    };
 
     /*** STEP 2: OPTIMIZE ***/
     bool flag_step_1_success = false;
@@ -460,7 +333,9 @@ namespace ego_planner
     cout << "plan_success=" << flag_step_1_success << endl;
     if (!flag_step_1_success)
     {
-      report(false);
+      if (route_seed)
+        return reboundReplan(start_pt, start_vel, start_acc, local_target_pt, local_target_vel,
+                             true, flag_randomPolyTraj, false);
       continous_failures_count_++;
       return false;
     }
@@ -477,21 +352,21 @@ namespace ego_planner
 
       double ratio;
       bool flag_step_2_success = true;
-      const int refinement_attempts = from_reference ? 4 : 1;
-      for (int attempt = 0; attempt < refinement_attempts && !pos.checkFeasibility(ratio, false); ++attempt)
+      if (!pos.checkFeasibility(ratio, false))
       {
+        cout << "Need to reallocate time." << endl;
+
         Eigen::MatrixXd optimal_control_points;
-        const double stretch = from_reference ? std::max(1.06, 1.04 * ratio) : ratio;
-        flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, stretch, ts, optimal_control_points);
-        if (!flag_step_2_success)
-          break;
-        pos = UniformBspline(optimal_control_points, 3, ts);
-        pos.setPhysicalLimits(pp_.max_vel_, pp_.max_acc_, pp_.feasibility_tolerance_);
+        flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points);
+        if (flag_step_2_success)
+          pos = UniformBspline(optimal_control_points, 3, ts);
       }
 
       if (!flag_step_2_success)
       {
-        report(false);
+        if (route_seed)
+          return reboundReplan(start_pt, start_vel, start_acc, local_target_pt, local_target_vel,
+                               true, flag_randomPolyTraj, false);
         printf("\033[34mThis refined trajectory hits obstacles. It doesn't matter if appeares occasionally. But if continously appearing, Increase parameter \"lambda_fitness\".\n\033[0m");
         continous_failures_count_++;
         return false;
@@ -510,23 +385,14 @@ namespace ego_planner
     // t_refine = ros::Time::now() - t_start;
     t_refine = rclcpp::Clock().now() - t_start;
 
-    if (from_reference)
-    {
-      pos.setPhysicalLimits(pp_.max_vel_, pp_.max_acc_, pp_.feasibility_tolerance_);
-      double ratio;
-      if (!pos.checkFeasibility(ratio, false) || bspline_optimizer_->trajectoryInCollision(pos))
-      {
-        report(false);
-        ++continous_failures_count_;
-        return false;
-      }
-    }
-    if (from_reference)
-      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("ego_planner.execution"), diagnostic_clock_, 1000,
-          "Optimized duration %.2fs, displacement over replan interval %.3fm",
-          pos.getTimeSum(), (pos.evaluateDeBoorT(std::min(replan_interval_, pos.getTimeSum())) -
-                            pos.evaluateDeBoorT(0.0)).norm());
-    report(true);
+    const auto &diagnostics = bspline_optimizer_->replanDiagnostics();
+    const double duration = pos.getTimeSum();
+    const Eigen::Vector3d displacement = pos.evaluateDeBoorT(std::min(1.0, duration)) -
+                                         pos.evaluateDeBoorT(0.0);
+    RCLCPP_INFO(rclcpp::get_logger("ego_planner.seed"),
+        "Seed=%s duration=%.3fs first_second=%.3fm local_astar=%u reused_guides=%u",
+        route_seed ? "global geometry" : (polynomial_seed ? "original polynomial" : "previous spline"),
+        duration, displacement.norm(), diagnostics.local_attempts, diagnostics.reuse_successes);
     // save planned results
     updateTrajInfo(pos, rclcpp::Clock().now());
 
@@ -850,28 +716,19 @@ namespace ego_planner
                                          Eigen::MatrixXd &ctrl_pts, double &dt, double &time_inc)
   {
     double time_origin = bspline.getTimeSum();
-    const Eigen::Vector3d start_position = bspline.evaluateDeBoorT(0.0);
-    const Eigen::Vector3d end_position = bspline.evaluateDeBoorT(time_origin);
     int seg_num = bspline.getControlPoint().cols() - 3;
 
-    const bool from_reference = global_data_.hasGridRoute();
-    if (!from_reference)
-      bspline.lengthenTime(ratio);
-    const double sample_duration = bspline.getTimeSum();
-    const double duration = from_reference ? time_origin * ratio : sample_duration;
+    bspline.lengthenTime(ratio);
+    double duration = bspline.getTimeSum();
     dt = duration / double(seg_num);
     time_inc = duration - time_origin;
 
     vector<Eigen::Vector3d> point_set;
-    for (int i = 0; i <= seg_num; ++i)
-      point_set.push_back(bspline.evaluateDeBoorT(sample_duration * i / seg_num));
-    UniformBspline::parameterizeToBspline(dt, point_set, start_end_derivative, ctrl_pts);
-    if (global_data_.hasGridRoute())
+    for (double time = 0.0; time <= duration + 1e-4; time += dt)
     {
-      setSplineBoundary(ctrl_pts, 1, dt, start_position, start_end_derivative[0], start_end_derivative[2]);
-      setSplineBoundary(ctrl_pts, ctrl_pts.cols() - 2, dt, end_position,
-                        start_end_derivative[1], start_end_derivative[3]);
+      point_set.push_back(bspline.evaluateDeBoorT(time));
     }
+    UniformBspline::parameterizeToBspline(dt, point_set, start_end_derivative, ctrl_pts);
   }
 
 } // namespace ego_planner

@@ -134,10 +134,6 @@ namespace ego_planner
 
     void readGivenWps();
     void planNextWaypoint(const Eigen::Vector3d next_wp, bool restart = false, bool exact = false);
-    std::chrono::steady_clock::time_point last_progress_log_{};
-    Eigen::Vector3d last_command_start_ = Eigen::Vector3d::Zero();
-    Eigen::Vector3d last_measured_start_ = Eigen::Vector3d::Zero();
-    bool new_goal_progress_ = true;
     void getLocalTarget();
     bool planGlobalRoute(const Eigen::Vector3d &goal, bool exact);
     nav_msgs::msg::Path previewGoal(const geometry_msgs::msg::PoseStamped &goal,
