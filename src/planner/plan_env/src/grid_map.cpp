@@ -251,6 +251,8 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   {
     current_floor_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
         "grid_map/occupancy_inflate_current_floor", 1);
+    drone_cube_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "grid_map/occupancy_inflate_drone_cube", 1);
     node_->declare_parameter("grid_map/ceiling_display_margin", 0.30);
     node_->declare_parameter("grid_map/hide_lower_floors", false);
     ceiling_height_pub_ = node_->create_publisher<std_msgs::msg::Float64>(
@@ -1750,85 +1752,86 @@ std::optional<double> GridMap::findDisplaySlab(const Eigen::Vector3d &position, 
   return std::nullopt;
 }
 
-void GridMap::updateDisplayCeiling(bool detect_floor)
+void GridMap::updateDisplayFloor()
 {
-  const auto &position = md_.camera_pos_;
-  const bool have_map = mp_.obstacles_from_octomap_ && md_.has_cloud_ &&
-                        md_.has_odom_ && position.allFinite() && isInMap(position);
-  // Invalidate immediately when passing into another floor or leaving the
-  // neighborhood. A temporary opening on the same floor keeps the estimate.
-  const bool invalidate = !have_map || (ceiling_height_ &&
-      (position.z() > *ceiling_height_ + 0.15 ||
-       (position.head<2>() - ceiling_origin_).norm() > 3.0));
-  if (invalidate)
-  {
-    ceiling_height_.reset();
-    pending_ceiling_.reset();
-    ceiling_confirmations_ = 0;
-  }
-
-  if (!detect_floor || invalidate || (floor_height_ &&
-      (position.z() < *floor_height_ - 0.15 || (position.head<2>() - floor_origin_).norm() > 3.0)))
-  {
-    floor_height_.reset();
-    pending_floor_.reset();
-    floor_confirmations_ = 0;
-  }
   const auto now = std::chrono::steady_clock::now();
-  if (!invalidate && now - last_ceiling_check_ < std::chrono::seconds(1))
+  if (now - last_ceiling_check_ < std::chrono::seconds(1))
     return;
-  if (have_map && now - last_ceiling_check_ >= std::chrono::seconds(1))
+  last_ceiling_check_ = now;
+
+  const auto &position = md_.camera_pos_;
+  if (mp_.obstacles_from_octomap_ && md_.has_cloud_ && md_.has_odom_ &&
+      position.allFinite() && isInMap(position))
   {
-    last_ceiling_check_ = now;
-    const auto observed = findDisplaySlab(position, true);
-    if (detect_floor)
-    {
-      const auto floor = findDisplaySlab(position, false);
-      if (!floor || (floor_height_ && std::abs(*floor_height_ - *floor) <= 0.2))
+    constexpr double slab_tolerance = 0.2;
+    constexpr double min_floor_change = 0.6;
+    auto confirmed = [&](std::optional<double> found, std::optional<double> &pending, int &count) {
+      if (!found)
       {
-        pending_floor_.reset();
-        floor_confirmations_ = 0;
-        if (floor)
-          floor_origin_ = position.head<2>();
+        pending.reset();
+        count = 0;
+        return false;
       }
-      else
+      count = pending && std::abs(*pending - *found) <= slab_tolerance ? count + 1 : 1;
+      pending = found;
+      if (count < 3)
+        return false;
+      pending.reset();
+      count = 0;
+      return true;
+    };
+
+    const auto observed_floor = findDisplaySlab(position, false);
+    auto floor = observed_floor;
+    if (floor && floor_height_)
+    {
+      const double difference = *floor - *floor_height_;
+      const bool above_current = difference >= min_floor_change &&
+          (!ceiling_height_ || position.z() > *ceiling_height_ - slab_tolerance);
+      const bool below_current = difference <= -min_floor_change &&
+          position.z() < *floor_height_ + slab_tolerance;
+      if (!above_current && !below_current)
+        floor.reset();
+    }
+
+    if (confirmed(floor, pending_floor_, floor_confirmations_))
+    {
+      const bool changed_floor = floor_height_.has_value();
+      floor_height_ = floor;
+      if (changed_floor)
       {
-        floor_confirmations_ = pending_floor_ && std::abs(*pending_floor_ - *floor) <= 0.2
-            ? floor_confirmations_ + 1 : 1;
-        pending_floor_ = floor;
-        if (floor_confirmations_ >= 3)
-        {
-          floor_height_ = floor;
-          floor_origin_ = position.head<2>();
-        }
+        // Transfer the last measured floor-to-ceiling distance to the new
+        // floor. It stays available even when the OctoMap has a ceiling gap.
+        ceiling_inferred_ = confirmed_room_height_.has_value();
+        if (ceiling_inferred_)
+          ceiling_height_ = *floor_height_ + *confirmed_room_height_;
+        else
+          ceiling_height_.reset();
+        pending_ceiling_.reset();
+        ceiling_confirmations_ = 0;
       }
     }
-    if (!observed)
+
+    auto ceiling = findDisplaySlab(position, true);
+    const bool on_active_floor = floor_height_ && observed_floor &&
+        std::abs(*floor_height_ - *observed_floor) <= slab_tolerance;
+    const bool can_correct_inferred = ceiling_inferred_ && on_active_floor;
+    const bool outside_active_floor = floor_height_ && (
+        position.z() < *floor_height_ - slab_tolerance ||
+        (ceiling_height_ && !can_correct_inferred && position.z() >= *ceiling_height_ + slab_tolerance));
+    // During a stair transition, the slabs from another level must not
+    // overwrite the active floor. Reject a ceiling through an open stairwell.
+    if (outside_active_floor || (!can_correct_inferred && ceiling && floor_height_ && confirmed_room_height_ &&
+        *ceiling - *floor_height_ > *confirmed_room_height_ + min_floor_change))
+      ceiling.reset();
+
+    if (confirmed(ceiling, pending_ceiling_, ceiling_confirmations_))
     {
-      pending_ceiling_.reset();
-      ceiling_confirmations_ = 0;
+      ceiling_height_ = ceiling;
+      ceiling_inferred_ = false;
+      if (floor_height_ && *ceiling_height_ - *floor_height_ >= 0.8)
+        confirmed_room_height_ = *ceiling_height_ - *floor_height_;
     }
-    else if (ceiling_height_ && std::abs(*ceiling_height_ - *observed) <= 0.2)
-    {
-      ceiling_origin_ = position.head<2>();
-      pending_ceiling_.reset();
-      ceiling_confirmations_ = 0;
-    }
-    else
-    {
-      ceiling_confirmations_ = pending_ceiling_ && std::abs(*pending_ceiling_ - *observed) <= 0.2
-          ? ceiling_confirmations_ + 1 : 1;
-      pending_ceiling_ = observed;
-      if (ceiling_confirmations_ >= 3)
-      {
-        ceiling_height_ = observed;
-        ceiling_origin_ = position.head<2>();
-      }
-    }
-  }
-  else if (!have_map)
-  {
-    last_ceiling_check_ = now;
   }
 
   std_msgs::msg::Float64 height;
@@ -1843,20 +1846,57 @@ void GridMap::publishMapInflate(bool all_info)
   const bool publish_floor = current_floor_pub_ && current_floor_pub_->get_subscription_count() > 0;
   const bool hide_lower = publish_floor && node_->get_parameter("grid_map/hide_lower_floors").as_bool();
   if (ceiling_height_pub_ && (publish_floor || ceiling_height_pub_->get_subscription_count() > 0))
-    updateDisplayCeiling(hide_lower);
+    updateDisplayFloor();
+
+  auto publish = [&](auto &points, const auto &publisher) {
+    points.width = points.points.size();
+    points.height = 1;
+    points.is_dense = true;
+    points.header.frame_id = mp_.frame_id_;
+    sensor_msgs::msg::PointCloud2 message;
+    pcl::toROSMsg(points, message);
+    publisher->publish(message);
+  };
+
+  if (drone_cube_pub_ && drone_cube_pub_->get_subscription_count() > 0)
+  {
+    pcl::PointCloud<pcl::PointXYZ> cube;
+    const auto &center = md_.camera_pos_;
+    if (md_.has_odom_ && center.allFinite() && isInMap(center))
+    {
+      const Eigen::Vector3d half = Eigen::Vector3d::Ones();
+      Eigen::Vector3i first, last;
+      posToIndex(center - half, first);
+      posToIndex(center + half, last);
+      boundIndex(first);
+      boundIndex(last);
+      for (int x = first.x(); x <= last.x(); ++x)
+        for (int y = first.y(); y <= last.y(); ++y)
+          for (int z = first.z(); z <= last.z(); ++z)
+          {
+            if (md_.occupancy_buffer_inflate_[toAddress(x, y, z)] == 0)
+              continue;
+            Eigen::Vector3d point;
+            indexToPos(Eigen::Vector3i(x, y, z), point);
+            if ((point - center).cwiseAbs().maxCoeff() <= 1.0)
+              cube.push_back(pcl::PointXYZ(point.x(), point.y(), point.z()));
+          }
+    }
+    publish(cube, drone_cube_pub_);
+  }
+
   if (!publish_full && !publish_floor)
     return;
 
   pcl::PointXYZ pt;
   pcl::PointCloud<pcl::PointXYZ> cloud, floor_cloud;
-  double cutoff = std::numeric_limits<double>::infinity();
+  double cutoff = -std::numeric_limits<double>::infinity();
   if (publish_floor && ceiling_height_)
   {
     // Allow for uneven mapped surfaces as well as vertical voxel inflation.
     const double margin = std::max(mp_.resolution_,
         node_->get_parameter("grid_map/ceiling_display_margin").as_double());
-    if (md_.camera_pos_.z() < *ceiling_height_)
-      cutoff = std::max(*ceiling_height_ - margin, md_.camera_pos_.z() + 0.5 * mp_.resolution_);
+    cutoff = *ceiling_height_ - margin;
   }
 
   const double lower_cutoff = hide_lower && floor_height_
@@ -1874,6 +1914,8 @@ void GridMap::publishMapInflate(bool all_info)
 
   boundIndex(min_cut);
   boundIndex(max_cut);
+  if (!publish_full && !ceiling_height_)
+    max_cut.z() = min_cut.z() - 1;
   if (!publish_full && std::isfinite(lower_cutoff))
     min_cut.z() = std::max(min_cut.z(), static_cast<int>(
         std::floor((lower_cutoff - mp_.map_origin_.z()) * mp_.resolution_inv_)));
@@ -1902,15 +1944,6 @@ void GridMap::publishMapInflate(bool all_info)
           floor_cloud.push_back(pt);
       }
 
-  auto publish = [&](auto &points, const auto &publisher) {
-    points.width = points.points.size();
-    points.height = 1;
-    points.is_dense = true;
-    points.header.frame_id = mp_.frame_id_;
-    sensor_msgs::msg::PointCloud2 message;
-    pcl::toROSMsg(points, message);
-    publisher->publish(message);
-  };
   if (publish_full)
     publish(cloud, map_inf_pub_);
   if (publish_floor)
