@@ -1785,8 +1785,15 @@ void GridMap::updateDisplayFloor()
       return true;
     };
 
+    const double nominal = node_->get_parameter("grid_map/nominal_floor_height").as_double();
+    const double room_height = confirmed_room_height_.value_or(
+        std::isfinite(nominal) && nominal >= 0.8 ? nominal : 3.0);
     const auto observed_floor = findDisplaySlab(position, false);
     auto floor = observed_floor;
+    if (floor && !floor_height_ && ceiling_height_ &&
+        position.z() >= *ceiling_height_ + slab_tolerance &&
+        *floor < *ceiling_height_ - slab_tolerance)
+      floor.reset(); // A gap can expose the previous floor through the stairs.
     if (floor && floor_height_)
     {
       const double difference = *floor - *floor_height_;
@@ -1800,17 +1807,15 @@ void GridMap::updateDisplayFloor()
 
     if (confirmed(floor, pending_floor_, floor_confirmations_))
     {
-      const bool changed_floor = floor_height_.has_value();
+      const bool changed_floor = floor_height_.has_value() ||
+          (ceiling_height_ && *floor >= *ceiling_height_ - slab_tolerance);
       floor_height_ = floor;
       if (changed_floor)
       {
         // Transfer the last measured floor-to-ceiling distance to the new
         // floor. It stays available even when the OctoMap has a ceiling gap.
-        ceiling_inferred_ = confirmed_room_height_.has_value();
-        if (ceiling_inferred_)
-          ceiling_height_ = *floor_height_ + *confirmed_room_height_;
-        else
-          ceiling_height_.reset();
+        ceiling_inferred_ = true;
+        ceiling_height_ = *floor_height_ + room_height;
         pending_ceiling_.reset();
         ceiling_confirmations_ = 0;
       }
@@ -1820,17 +1825,31 @@ void GridMap::updateDisplayFloor()
     const bool on_active_floor = floor_height_ && observed_floor &&
         std::abs(*floor_height_ - *observed_floor) <= slab_tolerance;
     const bool can_correct_inferred = ceiling_inferred_ && on_active_floor;
-    const bool outside_active_floor = floor_height_ && (
-        position.z() < *floor_height_ - slab_tolerance ||
-        (ceiling_height_ && !can_correct_inferred && position.z() >= *ceiling_height_ + slab_tolerance));
-    // During a stair transition, the slabs from another level must not
-    // overwrite the active floor. Reject a ceiling through an open stairwell.
-    if (outside_active_floor || (!can_correct_inferred && ceiling && floor_height_ && confirmed_room_height_ &&
-        *ceiling - *floor_height_ > *confirmed_room_height_ + min_floor_change))
+    const bool above_active = ceiling_height_ && !can_correct_inferred &&
+        position.z() >= *ceiling_height_ + slab_tolerance;
+    const double active_floor = floor_height_.value_or(
+        ceiling_height_ ? *ceiling_height_ - room_height : -std::numeric_limits<double>::infinity());
+    const bool below_active = position.z() < active_floor - slab_tolerance;
+    // The floor below a stair landing may be unobserved. A stable ceiling
+    // at another level can confirm the transition if the drone has crossed
+    // the active band's boundary and is within the candidate room.
+    const bool switch_by_ceiling = ceiling && ceiling_height_ &&
+        position.z() >= *ceiling - room_height - slab_tolerance &&
+        ((above_active && *ceiling >= *ceiling_height_ + min_floor_change) ||
+         (below_active && *ceiling <= *ceiling_height_ - min_floor_change));
+    if (!switch_by_ceiling && (above_active || below_active ||
+        (!can_correct_inferred && ceiling && floor_height_ && confirmed_room_height_ &&
+         *ceiling - *floor_height_ > *confirmed_room_height_ + min_floor_change)))
       ceiling.reset();
 
     if (confirmed(ceiling, pending_ceiling_, ceiling_confirmations_))
     {
+      if (switch_by_ceiling)
+      {
+        floor_height_.reset();
+        pending_floor_.reset();
+        floor_confirmations_ = 0;
+      }
       ceiling_height_ = ceiling;
       ceiling_inferred_ = false;
       if (floor_height_ && *ceiling_height_ - *floor_height_ >= 0.8)
