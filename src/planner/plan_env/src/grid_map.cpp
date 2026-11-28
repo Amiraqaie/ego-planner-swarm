@@ -1786,8 +1786,8 @@ void GridMap::updateDisplayFloor()
     };
 
     const double nominal = node_->get_parameter("grid_map/nominal_floor_height").as_double();
-    const double room_height = confirmed_room_height_.value_or(
-        std::isfinite(nominal) && nominal >= 0.8 ? nominal : 3.0);
+    const double nominal_height = std::isfinite(nominal) && nominal >= 0.8 ? nominal : 3.0;
+    const double room_height = confirmed_room_height_.value_or(nominal_height);
     const auto observed_floor = findDisplaySlab(position, false);
     auto floor = observed_floor;
     auto active_floor_before = floor_height_;
@@ -1871,7 +1871,7 @@ void GridMap::updateDisplayFloor()
       }
       ceiling_height_ = ceiling;
       ceiling_inferred_ = false;
-      if (floor_height_ && *ceiling_height_ - *floor_height_ >= 0.8)
+      if (floor_height_ && *ceiling_height_ - *floor_height_ >= 0.75 * nominal_height)
         confirmed_room_height_ = *ceiling_height_ - *floor_height_;
     }
 
@@ -1971,20 +1971,18 @@ void GridMap::publishMapInflate(bool all_info)
   }
 
   double lower_cutoff = -std::numeric_limits<double>::infinity();
-  if (hide_lower)
+  if (hide_lower && ceiling_height_)
   {
-    if (floor_height_)
-      lower_cutoff = *floor_height_ - mp_.resolution_;
-    else if (ceiling_height_)
-    {
-      // After a restart the ceiling can be confirmed before the floor.
-      // Use a provisional band instead of showing every lower level.
-      const double nominal = node_->get_parameter("grid_map/nominal_floor_height").as_double();
-      const double room_height = confirmed_room_height_.value_or(
-          std::isfinite(nominal) && nominal >= 0.8 ? nominal : 3.0);
-      lower_cutoff = std::min(*ceiling_height_ - room_height - mp_.resolution_,
-                             md_.camera_pos_.z() - mp_.resolution_);
-    }
+    const double nominal = node_->get_parameter("grid_map/nominal_floor_height").as_double();
+    const double nominal_height = std::isfinite(nominal) && nominal >= 0.8 ? nominal : 3.0;
+    const double room_height = confirmed_room_height_.value_or(nominal_height);
+    // Furniture or a landing can be the first surface below the probe.
+    // Keep the ground visible when that surface is too high for this room.
+    const bool have_room_floor = floor_height_ &&
+        *ceiling_height_ - *floor_height_ >= 0.75 * nominal_height;
+    const double display_floor = have_room_floor ? *floor_height_ : *ceiling_height_ - room_height;
+    // The active floor owns this boundary throughout the stair transition.
+    lower_cutoff = display_floor - mp_.resolution_;
   }
 
   Eigen::Vector3i min_cut = md_.local_bound_min_;
