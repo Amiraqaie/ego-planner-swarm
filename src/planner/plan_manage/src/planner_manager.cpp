@@ -598,15 +598,71 @@ namespace ego_planner
     const bool polynomial_clear = validateGlobalPolynomial(gl_traj, start_pos);
     Eigen::Vector3i start_voxel;
     grid_map_->posToIndex(start_pos, start_voxel);
-    const auto clear = [&](const vector<Eigen::Vector3d> &route) {
-      for (size_t i = 1; i < route.size(); ++i)
-        if (!std::isfinite(grid_map_->segmentCost(route[i - 1], route[i], true, &start_voxel)))
+    const double resolution = grid_map_->getResolution();
+    const Eigen::Vector3d origin = grid_map_->getOrigin();
+    const auto segment_clear = [&](const Eigen::Vector3d &a, const Eigen::Vector3d &b) {
+      if (!std::isfinite(grid_map_->segmentCost(a, b, true, &start_voxel)))
+        return false;
+
+      // A segment can cross a voxel corner between the cost samples. Check
+      // one point in every interval bounded by an actual voxel-plane crossing.
+      const Eigen::Vector3d start = (a - origin) / resolution;
+      const Eigen::Vector3d end = (b - origin) / resolution;
+      vector<double> crossings{0.0, 1.0};
+      for (int axis = 0; axis < 3; ++axis)
+      {
+        const double lower = std::min(start[axis], end[axis]);
+        const double upper = std::max(start[axis], end[axis]);
+        for (double plane = std::floor(lower) + 1.0; plane < upper; ++plane)
+          crossings.push_back((plane - start[axis]) / (end[axis] - start[axis]));
+      }
+      std::sort(crossings.begin(), crossings.end());
+      for (size_t j = 1; j < crossings.size(); ++j)
+      {
+        if (crossings[j] - crossings[j - 1] < 1e-10)
+          continue;
+        const Eigen::Vector3d point = a + (b - a) * (0.5 * (crossings[j - 1] + crossings[j]));
+        Eigen::Vector3i voxel;
+        grid_map_->posToIndex(point, voxel);
+        if (voxel != start_voxel && !grid_map_->isKnownFreePosition(point))
           return false;
+      }
       return true;
     };
-    const bool simplified_clear = !polynomial_clear && clear(points);
-    if (!polynomial_clear && !simplified_clear && !clear(raw_route))
-      return false;
+    bool simplified_clear = false;
+    if (!polynomial_clear)
+    {
+      // Keep the original shortcut endpoints. If a shortcut grazes a
+      // blocked voxel, retry shorter edges on just that raw subsection.
+      vector<Eigen::Vector3d> checked{raw_route.front()};
+      vector<double> checked_times{0.0};
+      size_t first = 0;
+      for (size_t wp = 1; wp < points.size(); ++wp)
+      {
+        size_t last = first + 1;
+        while (last < raw_route.size() && (raw_route[last] - points[wp]).squaredNorm() >= 1e-12)
+          ++last;
+        if (last == raw_route.size())
+          return false;
+        while (first < last)
+        {
+          size_t next = last;
+          while (next > first && !segment_clear(raw_route[first], raw_route[next]))
+            --next;
+          if (next == first)
+            return false;
+          checked.push_back(raw_route[next]);
+          checked_times.push_back(raw_times[next]);
+          first = next;
+        }
+      }
+      simplified_clear = checked.size() < raw_route.size();
+      if (simplified_clear)
+      {
+        points = std::move(checked);
+        simplified_times = std::move(checked_times);
+      }
+    }
     global_data_.setGlobalTraj(gl_traj, rclcpp::Clock().now());
     global_data_.raw_route_ = raw_route;
     global_data_.simplified_route_ = std::move(points);
