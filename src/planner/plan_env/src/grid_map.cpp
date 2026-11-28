@@ -251,6 +251,7 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   {
     current_floor_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
         "grid_map/occupancy_inflate_current_floor", 1);
+    node_->declare_parameter("grid_map/ceiling_display_margin", 0.30);
     ceiling_height_pub_ = node_->create_publisher<std_msgs::msg::Float64>(
         "grid_map/detected_ceiling_height", rclcpp::QoS(1).transient_local());
   }
@@ -1820,10 +1821,11 @@ void GridMap::publishMapInflate(bool all_info)
   double cutoff = std::numeric_limits<double>::infinity();
   if (publish_floor && ceiling_height_)
   {
-    // OctoMap obstacle import adds at most one vertical voxel of inflation.
-    const double below_slab = *ceiling_height_ - mp_.resolution_;
-    if (md_.camera_pos_.z() < below_slab)
-      cutoff = below_slab;
+    // Allow for uneven mapped surfaces as well as vertical voxel inflation.
+    const double margin = std::max(mp_.resolution_,
+        node_->get_parameter("grid_map/ceiling_display_margin").as_double());
+    if (md_.camera_pos_.z() < *ceiling_height_)
+      cutoff = std::max(*ceiling_height_ - margin, md_.camera_pos_.z() + 0.5 * mp_.resolution_);
   }
 
   Eigen::Vector3i min_cut = md_.local_bound_min_;
