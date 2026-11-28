@@ -1,5 +1,6 @@
 // #include <fstream>
 #include <ego_planner/planner_manager.h>
+#include <ego_planner/local_arc_timing.h>
 #include <thread>
 #include "visualization_msgs/msg/marker.hpp" // zx-todo
 
@@ -62,57 +63,99 @@ namespace ego_planner
   bool EGOPlannerManager::initializeFromReference(
       const Eigen::Vector3d &start, const Eigen::Vector3d &end,
       const Eigen::Vector3d &velocity, const Eigen::Vector3d &acceleration,
-      const Eigen::Vector3d &end_velocity, bool reuse_previous, double &ts,
+      bool reuse_previous, double &ts,
       vector<Eigen::Vector3d> &samples, vector<Eigen::Vector3d> &derivatives, Eigen::MatrixXd &control_points)
   {
     auto &reference = global_data_;
     const double begin = reference.local_reference_start_;
     const double finish = reference.local_reference_end_;
-    const double duration = finish - begin;
-    if (!std::isfinite(duration) || duration <= 1e-6)
+    const double global_duration = finish - begin;
+    if (!std::isfinite(global_duration) || global_duration <= 1e-6)
       return false;
 
-    const double sample_period = std::min(0.05, pp_.ctrl_pt_dist / (4.0 * pp_.max_vel_));
-    Eigen::Vector3d previous = start;
-    double arc = 0.0;
-    for (double t = begin; t < finish;)
+    // Use normalized subdivision so a uniformly time-scaled reference yields
+    // the same spatial polyline. Include the raw route knots at sharp turns.
+    vector<double> times{begin};
+    for (int i = 1; i < 512; ++i)
+      times.push_back(begin + global_duration * i / 512);
+    for (double t : reference.raw_times_)
+      if (t > begin && t < finish)
+        times.push_back(t);
+    times.push_back(finish);
+    std::sort(times.begin(), times.end());
+    vector<double> arc{0.0}, parameters{begin};
+    vector<Eigen::Vector3d> geometry{start};
+    for (double t : times)
     {
-      t = std::min(t + sample_period, finish);
-      const Eigen::Vector3d point = reference.referencePosition(t);
-      arc += (point - previous).norm();
-      previous = point;
+      const Eigen::Vector3d point = t == finish ? end : reference.referencePosition(t);
+      const double step = (point - geometry.back()).norm();
+      if (!std::isfinite(step))
+        return false;
+      if (step <= 1e-8)
+        continue;
+      arc.push_back(arc.back() + step);
+      geometry.push_back(point);
+      parameters.push_back(t);
     }
-    const double count = std::ceil(std::max(arc / pp_.ctrl_pt_dist, duration / ts));
+    if (arc.back() < 1e-6)
+      return false;
+
+    const Eigen::Vector3d tangent = (geometry.back() - geometry[geometry.size() - 2]).normalized();
+    const Eigen::Vector3d initial_tangent = (geometry[1] - start).normalized();
+    const double initial_speed = std::max(0.0, velocity.dot(initial_tangent));
+    const double reserve = std::clamp(1.0 - pp_.feasibility_tolerance_, 0.8, 0.98);
+    const double max_speed = pp_.max_vel_ * reserve;
+    const bool intermediate = finish < reference.global_duration_ - 1e-6;
+    const double terminal_speed = intermediate ? max_speed * 0.7 : 0.0;
+    const double acceleration_budget = pp_.max_acc_ * reserve *
+        (0.6 - 0.2 * std::clamp(acceleration.norm() / pp_.max_acc_, 0.0, 1.0));
+    const LocalArcTiming timing(arc.back(), max_speed, acceleration_budget, initial_speed, terminal_speed);
+    const double duration = timing.duration();
+    const double count = std::ceil(std::max(arc.back() / pp_.ctrl_pt_dist,
+                                            duration * max_speed / pp_.ctrl_pt_dist));
     if (!std::isfinite(count) || count > 256)
       return false;
     const int intervals = std::max(6, static_cast<int>(count));
     ts = duration / intervals;
+    auto &guide_times = reference.local_knot_reference_times_;
+    guide_times.clear();
     samples.reserve(intervals + 1);
+    size_t j = 1;
     for (int i = 0; i <= intervals; ++i)
-      samples.push_back(reference.referencePosition(std::min(begin + ts * i, finish)));
+    {
+      const double distance = timing.distanceAt(i == intervals ? duration : i * ts);
+      while (j + 1 < arc.size() && arc[j] < distance)
+        ++j;
+      const double u = (distance - arc[j - 1]) / (arc[j] - arc[j - 1]);
+      samples.push_back(geometry[j - 1] + u * (geometry[j] - geometry[j - 1]));
+      guide_times.push_back(parameters[j - 1] + u * (parameters[j] - parameters[j - 1]));
+    }
+    guide_times.back() = finish;
 
     vector<Eigen::Vector3d> seed = samples;
-    seed.front() = start;
-    seed.back() = end;
-    Eigen::Vector3d end_acceleration = reference.referenceAcceleration(finish);
-    const double acceleration_norm = end_acceleration.norm();
-    if (acceleration_norm > pp_.max_acc_)
-      end_acceleration *= pp_.max_acc_ / acceleration_norm;
-    derivatives = {velocity, end_velocity, acceleration, end_acceleration};
+    const Eigen::Vector3d local_end_velocity = timing.end_speed * tangent;
+    // The local terminal tangent is held with zero longitudinal acceleration.
+    const Eigen::Vector3d end_acceleration = Eigen::Vector3d::Zero();
+    derivatives = {velocity, local_end_velocity, acceleration, end_acceleration};
+    RCLCPP_INFO_THROTTLE(rclcpp::get_logger("ego_planner.timing"), diagnostic_clock_, 1000,
+        "Reference %.2fs, arc %.2fm, local %.2fs, controls %d, knot %.3fs, v0=(%.3f,%.3f,%.3f), "
+        "v1=(%.3f,%.3f,%.3f)", global_duration, arc.back(), duration, intervals + 3, ts,
+        velocity.x(), velocity.y(), velocity.z(),
+        local_end_velocity.x(), local_end_velocity.y(), local_end_velocity.z());
 
     auto fit = [&](const vector<Eigen::Vector3d> &positions, Eigen::MatrixXd &points) {
       UniformBspline::parameterizeToBspline(ts, positions, derivatives, points);
       // The original least-squares parameterization uses soft boundary rows.
       // Enforce the state exactly on the three uniform cubic endpoint controls.
       setSplineBoundary(points, 1, ts, start, velocity, acceleration);
-      setSplineBoundary(points, points.cols() - 2, ts, end, end_velocity, end_acceleration);
+      setSplineBoundary(points, points.cols() - 2, ts, end, local_end_velocity, end_acceleration);
     };
     fit(seed, control_points);
     if (!control_points.allFinite())
       return false;
 
     const double elapsed = (rclcpp::Clock().now() - local_data_.start_time_).seconds();
-    const double overlap = reuse_previous ? std::min(local_data_.duration_ - elapsed, duration) : 0.0;
+    const double overlap = reuse_previous ? std::min({local_data_.duration_ - elapsed, duration, 4.0 * ts}) : 0.0;
     if (reuse_previous && elapsed >= 0.0 && overlap >= 3.0 * ts)
     {
       for (int i = 1; i < intervals && i * ts < overlap; ++i)
@@ -135,7 +178,11 @@ namespace ego_planner
                      3.0 * points.col(j - 2) - points.col(j - 3)).squaredNorm();
           return cost;
         };
-        if (!bspline_optimizer_->trajectoryInCollision(previous_seed) &&
+        const double prefix = std::min(1.0, duration);
+        const Eigen::Vector3d advance = reference_seed.evaluateDeBoorT(prefix) - start;
+        const bool keeps_progress = (previous_seed.evaluateDeBoorT(prefix) - start).dot(advance)
+                                    >= 0.8 * advance.squaredNorm();
+        if (keeps_progress && !bspline_optimizer_->trajectoryInCollision(previous_seed) &&
             (bspline_optimizer_->trajectoryInCollision(reference_seed) ||
              smoothness(candidate) < smoothness(control_points)))
           control_points = std::move(candidate);
@@ -175,7 +222,7 @@ namespace ego_planner
     const bool from_reference = global_data_.hasGridRoute();
     if (from_reference)
     {
-      if (!initializeFromReference(start_pt, local_target_pt, start_vel, start_acc, local_target_vel,
+      if (!initializeFromReference(start_pt, local_target_pt, start_vel, start_acc,
                                    !flag_polyInit, ts, reference_samples, start_end_derivatives, ctrl_pts))
       {
         ++continous_failures_count_;
@@ -472,6 +519,11 @@ namespace ego_planner
         return false;
       }
     }
+    if (from_reference)
+      RCLCPP_INFO_THROTTLE(rclcpp::get_logger("ego_planner.execution"), diagnostic_clock_, 1000,
+          "Optimized duration %.2fs, displacement over replan interval %.3fm",
+          pos.getTimeSum(), (pos.evaluateDeBoorT(std::min(replan_interval_, pos.getTimeSum())) -
+                            pos.evaluateDeBoorT(0.0)).norm());
     report(true);
     // save planned results
     updateTrajInfo(pos, rclcpp::Clock().now());

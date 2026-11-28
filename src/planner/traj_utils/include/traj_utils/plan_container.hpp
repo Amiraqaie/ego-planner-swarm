@@ -20,7 +20,7 @@ namespace ego_planner
   public:
     PolynomialTraj global_traj_;
     vector<Eigen::Vector3d> raw_route_, simplified_route_;
-    vector<double> raw_times_;
+    vector<double> raw_times_, local_knot_reference_times_;
     bool polynomial_clear_ = false;
     Eigen::Vector3d progress_position_ = Eigen::Vector3d::Zero();
     double local_reference_start_ = 0.0;
@@ -91,6 +91,7 @@ namespace ego_planner
       raw_route_.clear();
       simplified_route_.clear();
       raw_times_.clear();
+      local_knot_reference_times_.clear();
       polynomial_clear_ = false;
     }
 

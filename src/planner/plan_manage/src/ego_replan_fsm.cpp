@@ -64,6 +64,7 @@ namespace ego_planner
     planner_manager_.reset(new EGOPlannerManager);
 
     planner_manager_->initPlanModules(node_, visualization_);
+    planner_manager_->setReplanInterval(replan_thresh_);
 
     planner_manager_->deliverTrajToOptimizer(); // store trajectories
     planner_manager_->setDroneIdtoOpt();
@@ -253,6 +254,7 @@ namespace ego_planner
 
       // Internal preset waypoint advances share the original goal identity.
       const bool new_goal = restart || exec_state_ == WAIT_TARGET || exec_state_ == INIT;
+    new_goal_progress_ = new_goal;
       if (new_goal)
       {
         auto &last_traj_id = planner_manager_->local_data_.traj_id_;
@@ -787,12 +789,12 @@ namespace ego_planner
         }
         else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_cur > replan_thresh_)
         {
-          changeFSMExecState(REPLAN_TRAJ, "FSM");
+          changeFSMExecState(REPLAN_TRAJ, "PERIODIC");
         }
       }
       else if (t_cur > replan_thresh_)
       {
-        changeFSMExecState(REPLAN_TRAJ, "FSM");
+        changeFSMExecState(REPLAN_TRAJ, "PERIODIC");
       }
 
       break;
@@ -1018,6 +1020,16 @@ namespace ego_planner
     {
 
       auto info = &planner_manager_->local_data_;
+      const auto now = std::chrono::steady_clock::now();
+      if (last_progress_log_.time_since_epoch().count() && !new_goal_progress_)
+        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+            "Progress since previous plan over %.2fs: commanded %.3fm, measured %.3fm",
+            std::chrono::duration<double>(now - last_progress_log_).count(),
+            (start_pt_ - last_command_start_).norm(), (odom_pos_ - last_measured_start_).norm());
+      last_progress_log_ = now;
+      last_command_start_ = info->start_pos_;
+      last_measured_start_ = odom_pos_;
+      new_goal_progress_ = false;
 
       traj_utils::msg::Bspline bspline;
       bspline.order = 3;

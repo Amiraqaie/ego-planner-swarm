@@ -499,8 +499,17 @@ namespace ego_planner
     const double duration = reference_->local_reference_end_ - start;
     // A cubic control point is centered roughly one knot before its index.
     const double intervals = points.cols() - 3;
-    const double a = start + duration * std::clamp((first - 1.0) / intervals, 0.0, 1.0);
-    const double b = start + duration * std::clamp((last - 1.0) / intervals, 0.0, 1.0);
+    const auto &knot_times = reference_->local_knot_reference_times_;
+    const auto referenceTime = [&](int control) {
+      const double progress = std::clamp((control - 1.0) / intervals, 0.0, 1.0);
+      if (knot_times.empty())
+        return start + duration * progress;
+      const double index = progress * (knot_times.size() - 1);
+      const size_t i = static_cast<size_t>(index);
+      return knot_times[i] + (index - i) * (knot_times[std::min(i + 1, knot_times.size() - 1)] - knot_times[i]);
+    };
+    const double a = referenceTime(first);
+    const double b = referenceTime(last);
     const double middle = (a + b) * 0.5;
     const double padding = std::min(1.0, duration * 0.25);
     auto edgeClear = [&](const Eigen::Vector3d &from, const Eigen::Vector3d &to) {
