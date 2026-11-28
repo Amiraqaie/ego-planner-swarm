@@ -247,6 +247,13 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   // 发布者
   map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy", 10);
   map_inf_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("grid_map/occupancy_inflate", 10);
+  if (node_->declare_parameter("grid_map/enable_current_floor_cloud", false))
+  {
+    current_floor_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "grid_map/occupancy_inflate_current_floor", 1);
+    ceiling_height_pub_ = node_->create_publisher<std_msgs::msg::Float64>(
+        "grid_map/detected_ceiling_height", rclcpp::QoS(1).transient_local());
+  }
 
   md_.occ_need_update_ = false;
   md_.local_updated_ = false;
@@ -1709,14 +1716,115 @@ void GridMap::publishMap()
   map_pub_->publish(cloud_msg);
 }
 
+void GridMap::updateDisplayCeiling()
+{
+  const auto &position = md_.camera_pos_;
+  const bool have_map = mp_.obstacles_from_octomap_ && md_.has_cloud_ &&
+                        md_.has_odom_ && position.allFinite() && isInMap(position);
+  // Invalidate immediately when passing into another floor or leaving the
+  // neighborhood. A temporary opening on the same floor keeps the estimate.
+  const bool invalidate = !have_map || (ceiling_height_ &&
+      (position.z() > *ceiling_height_ + 0.15 ||
+       (position.head<2>() - ceiling_origin_).norm() > 3.0));
+  if (invalidate)
+  {
+    ceiling_height_.reset();
+    pending_ceiling_.reset();
+    ceiling_confirmations_ = 0;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  if (!invalidate && now - last_ceiling_check_ < std::chrono::seconds(1))
+    return;
+  if (have_map && now - last_ceiling_check_ >= std::chrono::seconds(1))
+  {
+    last_ceiling_check_ = now;
+    std::vector<int> hits;
+    Eigen::Vector3i drone;
+    posToIndex(position, drone);
+    const int spacing = std::max(1, static_cast<int>(std::round(0.35 / mp_.resolution_)));
+    const int bottom = drone.z() + std::max(1, static_cast<int>(std::ceil(0.25 / mp_.resolution_)));
+    const int top = std::min(mp_.map_voxel_num_.z() - 1,
+                             drone.z() + static_cast<int>(4.0 / mp_.resolution_));
+    for (int dx = -2; dx <= 2; ++dx)
+      for (int dy = -2; dy <= 2; ++dy)
+      {
+        Eigen::Vector3i cell(drone.x() + dx * spacing, drone.y() + dy * spacing, bottom);
+        if (!isInMap(cell))
+          continue;
+        for (; cell.z() <= top; ++cell.z())
+          if (md_.occupancy_buffer_[toAddress(cell)] > mp_.min_occupancy_log_)
+          {
+            hits.push_back(cell.z());
+            break;
+          }
+      }
+    std::sort(hits.begin(), hits.end());
+    const int band = std::max(1, static_cast<int>(std::round(0.15 / mp_.resolution_)));
+    std::optional<double> observed;
+    for (auto low = hits.begin(), high = hits.begin(); low != hits.end(); ++low)
+    {
+      while (high != hits.end() && *high - *low <= band)
+        ++high;
+      if (high - low >= 9)
+      {
+        observed = mp_.map_origin_.z() + *low * mp_.resolution_;
+        break;
+      }
+    }
+    if (!observed)
+    {
+      pending_ceiling_.reset();
+      ceiling_confirmations_ = 0;
+    }
+    else if (ceiling_height_ && std::abs(*ceiling_height_ - *observed) <= 0.2)
+    {
+      ceiling_origin_ = position.head<2>();
+      pending_ceiling_.reset();
+      ceiling_confirmations_ = 0;
+    }
+    else
+    {
+      ceiling_confirmations_ = pending_ceiling_ && std::abs(*pending_ceiling_ - *observed) <= 0.2
+          ? ceiling_confirmations_ + 1 : 1;
+      pending_ceiling_ = observed;
+      if (ceiling_confirmations_ >= 3)
+      {
+        ceiling_height_ = observed;
+        ceiling_origin_ = position.head<2>();
+      }
+    }
+  }
+  else if (!have_map)
+  {
+    last_ceiling_check_ = now;
+  }
+
+  std_msgs::msg::Float64 height;
+  height.data = ceiling_height_.value_or(std::numeric_limits<double>::quiet_NaN());
+  ceiling_height_pub_->publish(height);
+}
+
 void GridMap::publishMapInflate(bool all_info)
 {
 
-  if (map_inf_pub_->get_subscription_count()<= 0)
+  const bool publish_full = map_inf_pub_->get_subscription_count() > 0;
+  const bool publish_floor = current_floor_pub_ && current_floor_pub_->get_subscription_count() > 0;
+  if (ceiling_height_pub_ && (publish_floor || ceiling_height_pub_->get_subscription_count() > 0))
+    updateDisplayCeiling();
+  if (!publish_full && !publish_floor)
     return;
 
   pcl::PointXYZ pt;
-  pcl::PointCloud<pcl::PointXYZ> cloud;
+  pcl::PointCloud<pcl::PointXYZ> cloud, floor_cloud;
+  double cutoff = std::numeric_limits<double>::infinity();
+  if (publish_floor && ceiling_height_)
+  {
+    // OctoMap obstacle import adds at most one vertical voxel of inflation.
+    const double below_slab = *ceiling_height_ - mp_.resolution_;
+    if (md_.camera_pos_.z() < below_slab)
+      cutoff = below_slab;
+  }
 
   Eigen::Vector3i min_cut = md_.local_bound_min_;
   Eigen::Vector3i max_cut = md_.local_bound_max_;
@@ -1730,6 +1838,9 @@ void GridMap::publishMapInflate(bool all_info)
 
   boundIndex(min_cut);
   boundIndex(max_cut);
+  if (!publish_full && std::isfinite(cutoff))
+    max_cut.z() = std::min(max_cut.z(), static_cast<int>(
+        std::floor((cutoff - mp_.map_origin_.z()) * mp_.resolution_inv_)));
 
   for (int x = min_cut(0); x <= max_cut(0); ++x)
     for (int y = min_cut(1); y <= max_cut(1); ++y)
@@ -1746,19 +1857,25 @@ void GridMap::publishMapInflate(bool all_info)
         pt.x = pos(0);
         pt.y = pos(1);
         pt.z = pos(2);
-        cloud.push_back(pt);
+        if (publish_full)
+          cloud.push_back(pt);
+        if (publish_floor && pos.z() < cutoff)
+          floor_cloud.push_back(pt);
       }
 
-  cloud.width = cloud.points.size();
-  cloud.height = 1;
-  cloud.is_dense = true;
-  cloud.header.frame_id = mp_.frame_id_;
-  sensor_msgs::msg::PointCloud2 cloud_msg;
-
-  pcl::toROSMsg(cloud, cloud_msg);
-  map_inf_pub_->publish(cloud_msg);
-
-  // RCLCPP_INFO(rclcpp::get_logger("publishMapInflate"), "pub map");
+  auto publish = [&](auto &points, const auto &publisher) {
+    points.width = points.points.size();
+    points.height = 1;
+    points.is_dense = true;
+    points.header.frame_id = mp_.frame_id_;
+    sensor_msgs::msg::PointCloud2 message;
+    pcl::toROSMsg(points, message);
+    publisher->publish(message);
+  };
+  if (publish_full)
+    publish(cloud, map_inf_pub_);
+  if (publish_floor)
+    publish(floor_cloud, current_floor_pub_);
 }
 
 bool GridMap::odomValid() { return md_.has_odom_; }
