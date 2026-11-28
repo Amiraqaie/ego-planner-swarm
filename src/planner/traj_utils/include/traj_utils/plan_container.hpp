@@ -1,6 +1,7 @@
 #ifndef _PLAN_CONTAINER_H_
 #define _PLAN_CONTAINER_H_
 
+#include <algorithm>
 #include <Eigen/Eigen>
 #include <vector>
 #include <rclcpp/rclcpp.hpp>
@@ -18,6 +19,46 @@ namespace ego_planner
   private:
   public:
     PolynomialTraj global_traj_;
+    vector<Eigen::Vector3d> raw_route_, simplified_route_;
+    vector<double> raw_times_;
+    bool polynomial_clear_ = false;
+    Eigen::Vector3d progress_position_ = Eigen::Vector3d::Zero();
+    double local_reference_start_ = 0.0;
+    double local_reference_end_ = 0.0;
+
+    bool hasGridRoute() const { return raw_times_.size() >= 2; }
+
+    size_t rawEdge(double t) const
+    {
+      auto next = std::upper_bound(raw_times_.begin(), raw_times_.end(), t);
+      return std::clamp<size_t>(next - raw_times_.begin(), 1, raw_times_.size() - 1);
+    }
+
+    Eigen::Vector3d referencePosition(double t)
+    {
+      if (!hasGridRoute() || polynomial_clear_)
+        return getPosition(t);
+      const size_t edge = rawEdge(t);
+      const double u = (t - raw_times_[edge - 1]) / (raw_times_[edge] - raw_times_[edge - 1]);
+      return raw_route_[edge - 1] + std::clamp(u, 0.0, 1.0) * (raw_route_[edge] - raw_route_[edge - 1]);
+    }
+
+    Eigen::Vector3d referenceVelocity(double t)
+    {
+      if (!hasGridRoute() || polynomial_clear_)
+        return getVelocity(t);
+      if (t >= global_duration_)
+        return Eigen::Vector3d::Zero();
+      const size_t edge = rawEdge(t);
+      return (raw_route_[edge] - raw_route_[edge - 1]) / (raw_times_[edge] - raw_times_[edge - 1]);
+    }
+
+    Eigen::Vector3d referenceAcceleration(double t)
+    {
+      if (hasGridRoute() && !polynomial_clear_)
+        return Eigen::Vector3d::Zero();
+      return getAcceleration(t);
+    }
     vector<UniformBspline> local_traj_;
 
     double global_duration_;
@@ -46,6 +87,11 @@ namespace ego_planner
       time_increase_ = 0.0;
       last_time_inc_ = 0.0;
       last_progress_time_ = 0.0;
+      local_reference_start_ = local_reference_end_ = 0.0;
+      raw_route_.clear();
+      simplified_route_.clear();
+      raw_times_.clear();
+      polynomial_clear_ = false;
     }
 
     void setLocalTraj(UniformBspline traj, double local_ts, double local_te, double time_inc)

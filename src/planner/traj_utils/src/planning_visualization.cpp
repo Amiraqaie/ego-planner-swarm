@@ -195,6 +195,55 @@ namespace ego_planner
     displayMarkerList(init_list_pub, init_pts, scale, color, id);
   }
 
+  void PlanningVisualization::displayReplanDebug(
+      const vector<Eigen::Vector3d> &reference, const vector<Eigen::Vector3d> &initial,
+      const Eigen::MatrixXd &control_points,
+      const vector<vector<Eigen::Vector3d>> &reused_guides,
+      const vector<vector<Eigen::Vector3d>> &local_guides)
+  {
+    using visualization_msgs::msg::Marker;
+    visualization_msgs::msg::MarkerArray array;
+    array.markers.emplace_back().action = Marker::DELETEALL;
+    array.markers.back().header.frame_id = "map";
+
+    auto add = [&](const char *name, int id, const auto &positions, const Eigen::Vector3d &color, int type) {
+      if (positions.empty())
+        return;
+      auto &marker = array.markers.emplace_back();
+      marker.header.frame_id = "map";
+      marker.ns = name;
+      marker.id = id;
+      marker.type = type;
+      marker.pose.orientation.w = 1.0;
+      marker.scale.x = marker.scale.y = marker.scale.z = 0.055;
+      marker.color.r = color.x();
+      marker.color.g = color.y();
+      marker.color.b = color.z();
+      marker.color.a = 1.0;
+      for (const Eigen::Vector3d &position : positions)
+      {
+        if (!position.allFinite())
+          continue;
+        auto &point = marker.points.emplace_back();
+        point.x = position.x();
+        point.y = position.y();
+        point.z = position.z();
+      }
+    };
+
+    add("global_reference_subsection", 0, reference, {0.0, 0.8, 1.0}, Marker::LINE_STRIP);
+    add("initial_bspline", 0, initial, {1.0, 0.8, 0.0}, Marker::LINE_STRIP);
+    vector<Eigen::Vector3d> controls;
+    for (int i = 0; i < control_points.cols(); ++i)
+      controls.push_back(control_points.col(i));
+    add("initial_control_points", 0, controls, {1.0, 1.0, 1.0}, Marker::SPHERE_LIST);
+    for (size_t i = 0; i < reused_guides.size(); ++i)
+      add("reused_global_guide", i, reused_guides[i], {0.2, 1.0, 0.2}, Marker::LINE_STRIP);
+    for (size_t i = 0; i < local_guides.size(); ++i)
+      add("local_astar_guide", i, local_guides[i], {1.0, 0.0, 1.0}, Marker::LINE_STRIP);
+    replan_debug_pub_->publish(array);
+  }
+
   void PlanningVisualization::displayAStarList(std::vector<std::vector<Eigen::Vector3d>> a_star_paths, int id /* = Eigen::Vector4d(0.5,0.5,0,1)*/)
   {
 

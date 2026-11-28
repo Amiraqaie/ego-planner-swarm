@@ -114,6 +114,18 @@ namespace ego_planner
 
     ControlPoints getControlPoints() { return cps_; };
 
+    struct ReplanDiagnostics
+    {
+      unsigned local_attempts = 0, local_successes = 0, local_failures = 0;
+      unsigned reuse_attempts = 0, reuse_successes = 0, initial_collisions = 0;
+      double local_search_ms = 0.0;
+      vector<vector<Eigen::Vector3d>> reused_guides, local_guides;
+    };
+
+    void beginReplan(const GlobalTrajData &reference, double interval);
+    const ReplanDiagnostics &replanDiagnostics() const { return diagnostics_; }
+    bool trajectoryInCollision(UniformBspline &trajectory);
+
     AStar::Ptr a_star_;
     std::vector<Eigen::Vector3d> ref_pts_;
 
@@ -195,7 +207,15 @@ namespace ego_planner
     void calcFitnessCost(const Eigen::MatrixXd &q, double &cost, Eigen::MatrixXd &gradient);
     bool check_collision_and_rebound(void);
     int collisionCheckEndIndex(int end) const;
-    bool firstCollision(UniformBspline &trajectory, double &time);
+    double collisionSampleStep(UniformBspline &trajectory) const;
+    bool firstCollision(UniformBspline &trajectory, double &time, double fraction);
+    vector<Eigen::Vector3d> referenceGuide(const Eigen::MatrixXd &points, int first, int last);
+    bool assignCollisionGuide(const Eigen::MatrixXd &points, int first, int last, int lower, int upper);
+    bool addGuideAnchors(const Eigen::MatrixXd &points, int first, int last, int lower, int upper,
+                         const vector<Eigen::Vector3d> &guide);
+    void appendSplineCollisions(const Eigen::MatrixXd &points, vector<std::pair<int, int>> &segments, bool initial);
+    const GlobalTrajData *reference_ = nullptr;
+    ReplanDiagnostics diagnostics_;
     double collision_check_fraction_ = 1.0;
 
     static int earlyExit(void *func_data, const double *x, const double *g, const double fx, const double xnorm, const double gnorm, const double step, int n, int k, int ls);

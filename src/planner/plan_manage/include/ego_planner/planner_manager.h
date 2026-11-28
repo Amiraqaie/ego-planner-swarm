@@ -34,7 +34,8 @@ namespace ego_planner
     bool planGlobalTraj(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
                         const Eigen::Vector3d &end_pos, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
     bool planGlobalTrajWaypoints(const Eigen::Vector3d &start_pos, const Eigen::Vector3d &start_vel, const Eigen::Vector3d &start_acc,
-                                 const std::vector<Eigen::Vector3d> &waypoints, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
+                                 const std::vector<Eigen::Vector3d> &waypoints, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc,
+                                 const std::vector<Eigen::Vector3d> &raw_route);
 
     void initPlanModules(rclcpp::Node::SharedPtr &node, PlanningVisualization::Ptr vis = NULL);
 
@@ -64,6 +65,14 @@ namespace ego_planner
     BsplineOptimizer::Ptr bspline_optimizer_;
 
     int continous_failures_count_{0};
+    rclcpp::Clock diagnostic_clock_{RCL_STEADY_TIME};
+
+    bool validateGlobalPolynomial(PolynomialTraj &trajectory, const Eigen::Vector3d &start);
+    bool initializeFromReference(const Eigen::Vector3d &start, const Eigen::Vector3d &end,
+                                 const Eigen::Vector3d &velocity, const Eigen::Vector3d &acceleration,
+                                 const Eigen::Vector3d &end_velocity, bool reuse_previous,
+                                 double &ts, vector<Eigen::Vector3d> &samples,
+                                 vector<Eigen::Vector3d> &derivatives, Eigen::MatrixXd &control_points);
 
     void updateTrajInfo(const UniformBspline &position_traj, const rclcpp::Time time_now);
 

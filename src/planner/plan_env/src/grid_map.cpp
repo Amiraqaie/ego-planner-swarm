@@ -424,28 +424,73 @@ double GridMap::softClearanceCost(const Eigen::Vector3d &pos, Eigen::Vector3d &g
   return cost;
 }
 
+float GridMap::segmentCost(const Eigen::Vector3d &a, const Eigen::Vector3d &b, bool known_free,
+                           const Eigen::Vector3i *escape_voxel)
+{
+  const float infinity = std::numeric_limits<float>::infinity();
+  if (!a.allFinite() || !b.allFinite() || !isInMap(a) || !isInMap(b))
+    return infinity;
+  const double len = (b - a).norm();
+  const int samples = std::max(1, static_cast<int>(std::ceil(len / (0.5 * mp_.resolution_))));
+  double penalty = 0.0;
+  for (int i = 0; i <= samples; ++i)
+  {
+    Eigen::Vector3i id;
+    posToIndex(a + (b - a) * (static_cast<double>(i) / samples), id);
+    if (!isInMap(id))
+      return infinity;
+    const int address = toAddress(id);
+    if (md_.occupancy_buffer_inflate_[address] != 0 ||
+        (known_free && md_.free_buffer_[address] != 1 && !(escape_voxel && id == *escape_voxel)))
+      return infinity;
+    if (hasSoftClearance())
+      penalty += clearance_cost_[address] * (i == 0 || i == samples ? 0.5 : 1.0);
+  }
+  return len * mp_.resolution_inv_ * (1.0 + penalty / samples);
+}
+
 bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
                              std::vector<Eigen::Vector3d> &path, bool exact,
                              std::chrono::steady_clock::time_point deadline,
-                             bool *search_limit_hit)
+                             bool *search_limit_hit, std::vector<Eigen::Vector3d> *raw_path)
+{
+  return searchPath(start, goal, path, exact, deadline, search_limit_hit, raw_path, false);
+}
+
+bool GridMap::searchLocalPath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
+                             std::vector<Eigen::Vector3d> &path,
+                             std::chrono::steady_clock::time_point deadline)
+{
+  return searchPath(start, goal, path, true, deadline, nullptr, nullptr, true);
+}
+
+bool GridMap::searchPath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
+                             std::vector<Eigen::Vector3d> &path, bool exact,
+                             std::chrono::steady_clock::time_point deadline,
+                             bool *search_limit_hit, std::vector<Eigen::Vector3d> *raw_path, bool local)
 {
   path.clear();
+  if (raw_path)
+    raw_path->clear();
+  const bool known_free = !local || useFreeSpaceOnly();
   if (search_limit_hit)
     *search_limit_hit = false;
-  if (!isInMap(start) || !isInMap(goal) || (exact && !isKnownFreePosition(goal)))
+  if (!start.allFinite() || !goal.allFinite() || !isInMap(start) || !isInMap(goal) ||
+      (exact && (known_free ? !isKnownFreePosition(goal) : getInflateOccupancy(goal) != 0)))
     return false;
 
   const int s = std::max(1, mp_.free_astar_stride_);
   const int ny = mp_.map_voxel_num_(1);
   const int nz = mp_.map_voxel_num_(2);
   const bool soft = hasSoftClearance();
+  const bool use_metric_cost = local || soft;
   const float infinity = std::numeric_limits<float>::infinity();
 
   auto passable = [&](const Eigen::Vector3i &id) {
     if (!isInMap(id))
       return false;
     const int a = toAddress(id);
-    return md_.free_buffer_[a] == 1 && md_.occupancy_buffer_inflate_[a] == 0;
+    return (!known_free || md_.free_buffer_[a] == 1) && md_.occupancy_buffer_inflate_[a] == 0;
   };
   auto toId = [&](int a) {
     return Eigen::Vector3i(a / (ny * nz), (a / nz) % ny, a % nz);
@@ -454,32 +499,21 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
   Eigen::Vector3i si, gi;
   posToIndex(start, si);
   posToIndex(goal, gi);
-  auto segmentCost = [&](const Eigen::Vector3d &a, const Eigen::Vector3d &b) -> float {
-    const double len = (b - a).norm();
-    const int samples = std::max(1, static_cast<int>(std::ceil(len / (0.5 * mp_.resolution_))));
-    double penalty = 0.0;
-    for (int i = 0; i <= samples; ++i)
-    {
-      Eigen::Vector3i id;
-      posToIndex(a + (b - a) * (static_cast<double>(i) / samples), id);
-      // A scan can leave the drone's current voxel unobserved. Escape only
-      // that voxel, and only if it is outside the inflated obstacles.
-      if (!(exact && id == si && md_.occupancy_buffer_inflate_[toAddress(si)] == 0) && !passable(id))
-        return infinity;
-      if (soft)
-        penalty += clearance_cost_[toAddress(id)] * (i == 0 || i == samples ? 0.5 : 1.0);
-    }
-    return len * mp_.resolution_inv_ * (1.0 + penalty / samples);
+  // Only the global search may leave an unobserved starting voxel.
+  auto edgeCost = [&](const Eigen::Vector3d &a, const Eigen::Vector3d &b) {
+    return segmentCost(a, b, known_free, exact && !local ? &si : nullptr);
   };
   const float direct = exact && (goal - start).norm() <= mp_.free_astar_max_seg_
-      ? segmentCost(start, goal) : infinity;
+      ? edgeCost(start, goal) : infinity;
   if (std::isfinite(direct) && (!soft || direct <= (goal - start).norm() * mp_.resolution_inv_ + 1e-5))
   {
     path = {start, goal};
+    if (raw_path)
+      *raw_path = path;
     return true;
   }
   auto h = [&](const Eigen::Vector3i &id) -> float {
-    if (!soft)
+    if (!use_metric_cost)
       return (id - gi).cast<float>().norm();
     Eigen::Vector3d p;
     indexToPos(id, p);
@@ -511,10 +545,10 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
     const float gc = g[cur.adr];
     if (cur.f - h(id) > gc + 1e-3f)
       continue;   // stale queue entry
-    if (soft && exact && cur.f >= goal_cost)
+    if (use_metric_cost && exact && cur.f >= goal_cost)
       break;
     ++expanded;
-    if (exact && expanded % 128 == 0 && std::chrono::steady_clock::now() >= deadline)
+    if (exact && (local || expanded % 128 == 0) && std::chrono::steady_clock::now() >= deadline)
     {
       if (search_limit_hit)
         *search_limit_hit = true;
@@ -531,12 +565,12 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
       current = start;
     if ((id - gi).cwiseAbs().maxCoeff() <= s)
     {
-      const float tail = exact ? segmentCost(current, goal) : 0.0f;
+      const float tail = exact ? edgeCost(current, goal) : 0.0f;
       if (std::isfinite(tail) && gc + tail < goal_cost)
       {
         goal_adr = cur.adr;
         goal_cost = gc + tail;
-        if (!soft || !exact)
+        if (!use_metric_cost || !exact)
           break;
       }
     }
@@ -555,10 +589,10 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
           {
             Eigen::Vector3d neighbor;
             indexToPos(nb, neighbor);
-            const float checked = segmentCost(current, neighbor);
+            const float checked = edgeCost(current, neighbor);
             if (!std::isfinite(checked))
               continue;
-            if (soft)
+            if (use_metric_cost)
               step_cost = checked;
           }
           const int na = toAddress(nb);
@@ -597,6 +631,13 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
   }
   if (raw.size() < 2)
     return false;
+  if (raw_path)
+    *raw_path = raw;
+  if (local)
+  {
+    path = std::move(raw);
+    return reached;
+  }
 
   // Keep a shortcut only if it preserves the clearance benefit of the search.
   std::vector<double> prefix_cost;
@@ -604,7 +645,7 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
   {
     prefix_cost.assign(raw.size(), 0.0);
     for (size_t i = 1; i < raw.size(); ++i)
-      prefix_cost[i] = prefix_cost[i - 1] + segmentCost(raw[i - 1], raw[i]);
+      prefix_cost[i] = prefix_cost[i - 1] + edgeCost(raw[i - 1], raw[i]);
   }
 
   path.push_back(raw.front());
@@ -616,7 +657,7 @@ bool GridMap::searchFreePath(const Eigen::Vector3d &start, const Eigen::Vector3d
     {
       if ((raw[j] - raw[i]).norm() <= mp_.free_astar_max_seg_)
       {
-        const float shortcut = segmentCost(raw[i], raw[j]);
+        const float shortcut = edgeCost(raw[i], raw[j]);
         if (std::isfinite(shortcut) && (!soft || shortcut <= prefix_cost[j] - prefix_cost[i] + 1e-4))
           break;
       }

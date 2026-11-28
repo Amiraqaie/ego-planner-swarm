@@ -244,7 +244,7 @@ namespace ego_planner
       vector<Eigen::Vector3d> gloabl_traj(i_end);
       for (int i = 0; i < i_end; i++)
       {
-        gloabl_traj[i] = planner_manager_->global_data_.global_traj_.evaluate(i * step_size_t);
+        gloabl_traj[i] = planner_manager_->global_data_.referencePosition(i * step_size_t);
       }
 
       end_vel_.setZero();
@@ -834,6 +834,9 @@ namespace ego_planner
     start_vel_ = odom_vel_;
     start_acc_.setZero();
 
+    if (planner_manager_->global_data_.hasGridRoute())
+      return callReboundReplan(true, false);
+
     bool flag_random_poly_init;
     if (timesOfConsecutiveStateCalls().first == 1)
       flag_random_poly_init = false;
@@ -858,10 +861,26 @@ namespace ego_planner
     auto time_now = rclcpp::Clock().now();
     // double t_cur = (time_now - info->start_time_).toSec();
     double t_cur = (time_now - info->start_time_).seconds();
+    const bool has_route = planner_manager_->global_data_.hasGridRoute();
+    const bool holding = has_route && t_cur >= info->duration_;
+    if (has_route)
+      t_cur = std::clamp(t_cur, 0.0, info->duration_);
 
     start_pt_ = info->position_traj_.evaluateDeBoorT(t_cur);
     start_vel_ = info->velocity_traj_.evaluateDeBoorT(t_cur);
     start_acc_ = info->acceleration_traj_.evaluateDeBoorT(t_cur);
+    if (holding)
+    {
+      start_vel_.setZero();
+      start_acc_.setZero();
+    }
+
+    if (has_route)
+    {
+      if (callReboundReplan(false, false))
+        return true;
+      return callReboundReplan(true, false);
+    }
 
     bool success = callReboundReplan(false, false);
 
@@ -985,6 +1004,13 @@ namespace ego_planner
     bool plan_and_refine_success =
         planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj);
     have_new_target_ = false;
+    auto &reference = planner_manager_->global_data_;
+    if (plan_and_refine_success && reference.hasGridRoute() &&
+        reference.local_reference_start_ > reference.last_progress_time_)
+    {
+      reference.last_progress_time_ = reference.local_reference_start_;
+      reference.progress_position_ = odom_pos_;
+    }
 
     cout << "refine_success=" << plan_and_refine_success << endl;
 
@@ -1220,8 +1246,9 @@ namespace ego_planner
     auto map = planner_manager_->grid_map_;
     if (use_astar_global_ && map->useFreeSpaceOnly())
     {
-      std::vector<Eigen::Vector3d> path;
-      const bool reached = map->searchFreePath(odom_pos_, goal, path, exact);
+      std::vector<Eigen::Vector3d> path, raw;
+      const bool reached = map->searchFreePath(odom_pos_, goal, path, exact,
+          std::chrono::steady_clock::time_point::max(), nullptr, &raw);
       if (exact && !reached)
       {
         RCLCPP_WARN(node_->get_logger(), "3D goal is no longer reachable through known free space.");
@@ -1241,7 +1268,7 @@ namespace ego_planner
         std::vector<Eigen::Vector3d> wps(path.begin() + 1, path.end());
         if (planner_manager_->planGlobalTrajWaypoints(
                 odom_pos_, odom_vel_, Eigen::Vector3d::Zero(),
-                wps, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()))
+                wps, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), raw))
         {
           RCLCPP_INFO(node_->get_logger(), "Free-space A* route: %zu waypoints", wps.size());
           return true;
@@ -1264,7 +1291,7 @@ namespace ego_planner
     Eigen::Vector3d last = odom_pos_;
     for (double t = gd.last_progress_time_; t < gd.global_duration_ && travelled < planning_horizen_; t += 0.05)
     {
-      const Eigen::Vector3d p = gd.getPosition(t);
+      const Eigen::Vector3d p = gd.referencePosition(t);
       travelled += (p - last).norm();
       last = p;
       if ((p - odom_pos_).norm() < 0.3)
@@ -1314,6 +1341,59 @@ namespace ego_planner
 
   void EGOReplanFSM::getLocalTarget()
   {
+    auto &reference = planner_manager_->global_data_;
+    if (reference.hasGridRoute())
+    {
+      // Project only onto a forward neighborhood reachable since the last
+      // accepted projection, then stop at the first distance minimum.
+      const double step = std::min(0.05, planning_horizen_ / (20 * planner_manager_->pp_.max_vel_));
+      const double moved = (odom_pos_ - reference.progress_position_).norm();
+      const double resolution = planner_manager_->grid_map_->getResolution();
+      double progress = reference.last_progress_time_;
+      Eigen::Vector3d previous = reference.referencePosition(progress);
+      double best = (odom_pos_ - previous).squaredNorm();
+      double arc = 0.0;
+      for (double t = progress; moved > 0.01 && t < reference.global_duration_;)
+      {
+        t = std::min(t + step, reference.global_duration_);
+        const Eigen::Vector3d point = reference.referencePosition(t);
+        arc += (point - previous).norm();
+        if (arc > 1.5 * moved + resolution)
+          break;
+        const double distance = (odom_pos_ - point).squaredNorm();
+        if (distance > best + 1e-8)
+          break;
+        if (distance < best)
+        {
+          progress = t;
+          best = distance;
+        }
+        previous = point;
+      }
+
+      auto map = planner_manager_->grid_map_;
+      double target = progress;
+      double last_free = progress;
+      while (target < reference.global_duration_)
+      {
+        target = std::min(target + step, reference.global_duration_);
+        const Eigen::Vector3d point = reference.referencePosition(target);
+        if (map->getInflateOccupancy(point) == 0)
+          last_free = target;
+        if ((point - start_pt_).norm() >= planning_horizen_)
+          break;
+      }
+      target = last_free;
+      reference.local_reference_start_ = progress;
+      reference.local_reference_end_ = target;
+      local_target_pt_ = reference.referencePosition(target);
+      local_target_vel_ = reference.referenceVelocity(target);
+      const double speed = local_target_vel_.norm();
+      if (speed > planner_manager_->pp_.max_vel_)
+        local_target_vel_ *= planner_manager_->pp_.max_vel_ / speed;
+      return;
+    }
+
     double t;
 
     double t_step = planning_horizen_ / 20 / planner_manager_->pp_.max_vel_;

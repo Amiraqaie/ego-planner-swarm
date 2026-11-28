@@ -484,6 +484,201 @@ namespace ego_planner
    * It was written separately, just because I did it once and it has been running stably since March 2020.
    * But I will merge then someday.*/
   // 初始化控制点
+  void BsplineOptimizer::beginReplan(const GlobalTrajData &reference, double interval)
+  {
+    reference_ = reference.hasGridRoute() ? &reference : nullptr;
+    diagnostics_ = ReplanDiagnostics{};
+    bspline_interval_ = interval;
+  }
+
+  vector<Eigen::Vector3d> BsplineOptimizer::referenceGuide(const Eigen::MatrixXd &points, int first, int last)
+  {
+    const auto &raw = reference_->raw_route_;
+    const auto &times = reference_->raw_times_;
+    const double start = reference_->local_reference_start_;
+    const double duration = reference_->local_reference_end_ - start;
+    // A cubic control point is centered roughly one knot before its index.
+    const double intervals = points.cols() - 3;
+    const double a = start + duration * std::clamp((first - 1.0) / intervals, 0.0, 1.0);
+    const double b = start + duration * std::clamp((last - 1.0) / intervals, 0.0, 1.0);
+    const double middle = (a + b) * 0.5;
+    const double padding = std::min(1.0, duration * 0.25);
+    auto edgeClear = [&](const Eigen::Vector3d &from, const Eigen::Vector3d &to) {
+      return std::isfinite(grid_map_->segmentCost(from, to, true));
+    };
+
+    auto connect = [&](const Eigen::Vector3d &point, double low, double high) {
+      size_t best = raw.size();
+      double distance = 1.5; // A distant route is not a local collision guide.
+      size_t i = std::lower_bound(times.begin(), times.end(), low) - times.begin();
+      for (; i < raw.size() && times[i] <= high; ++i)
+      {
+        const double candidate = (point - raw[i]).norm();
+        if (candidate < distance && edgeClear(point, raw[i]))
+        {
+          distance = candidate;
+          best = i;
+        }
+      }
+      return best;
+    };
+
+    const size_t from = connect(points.col(first), a - padding, middle);
+    const size_t to = connect(points.col(last), middle, b + padding);
+    if (from >= to || to >= raw.size())
+      return {};
+    for (size_t i = from; i < to; ++i)
+      if (!edgeClear(raw[i], raw[i + 1]))
+        return {};
+
+    vector<Eigen::Vector3d> guide{points.col(first)};
+    guide.insert(guide.end(), raw.begin() + from, raw.begin() + to + 1);
+    guide.push_back(points.col(last));
+    return guide;
+  }
+
+  bool BsplineOptimizer::addGuideAnchors(const Eigen::MatrixXd &points, int first, int last,
+                                         int lower, int upper, const vector<Eigen::Vector3d> &guide)
+  {
+    int anchor = -1;
+    for (int j = lower; j <= upper; ++j)
+      cps_.flag_temp[j] = false;
+    const bool single_edge = last - first == 1;
+    const double resolution = grid_map_->getResolution();
+    for (int j = std::max(lower, single_edge ? first : first + 1); j < last && j <= upper; ++j)
+    {
+      const Eigen::Vector3d center = single_edge ? (points.col(first) + points.col(last)) / 2
+                                                : Eigen::Vector3d(points.col(j));
+      const Eigen::Vector3d tangent = points.col(single_edge ? last : j + 1) -
+                                      points.col(single_edge ? first : j - 1);
+      // Intersect the guide with the control-point plane used by rebound.
+      // Scan edges explicitly so guides with turns cannot index past an end.
+      Eigen::Vector3d intersection;
+      double length = std::numeric_limits<double>::infinity();
+      for (size_t k = 1; k < guide.size(); ++k)
+      {
+        const double a = (guide[k - 1] - center).dot(tangent);
+        const double b = (guide[k] - center).dot(tangent);
+        if ((a > 0 && b > 0) || (a < 0 && b < 0) || std::abs(a - b) < 1e-10)
+          continue;
+        const Eigen::Vector3d point = guide[k - 1] + a / (a - b) * (guide[k] - guide[k - 1]);
+        const double distance = (point - center).norm();
+        if (distance > (single_edge ? 0.01 : 1e-5) && distance < length &&
+            grid_map_->getInflateOccupancy(point) == 0)
+        {
+          intersection = point;
+          length = distance;
+        }
+      }
+      if (!std::isfinite(length))
+        continue;
+
+      const Eigen::Vector3d direction = (intersection - center) / length;
+      double offset = 0.0;
+      for (double d = length; !single_edge && d >= 0.0; d -= resolution)
+      {
+        const bool occupied = grid_map_->getInflateOccupancy(center + d * direction) != 0;
+        if (occupied || d < resolution)
+        {
+          offset = occupied ? std::min(length, d + resolution) : d;
+          break;
+        }
+      }
+      cps_.base_point[j].push_back(points.col(j) + offset * direction);
+      cps_.direction[j].push_back(direction);
+      cps_.flag_temp[j] = true;
+      anchor = j;
+    }
+    if (anchor < 0)
+      return false;
+
+    for (int direction : {-1, 1})
+      for (int j = anchor + direction; j >= lower && j <= upper; j += direction)
+        if (!cps_.flag_temp[j])
+        {
+          cps_.base_point[j].push_back(cps_.base_point[j - direction].back());
+          cps_.direction[j].push_back(cps_.direction[j - direction].back());
+        }
+    return true;
+  }
+
+  bool BsplineOptimizer::assignCollisionGuide(const Eigen::MatrixXd &points, int first, int last,
+                                              int lower, int upper)
+  {
+    if (last <= first || lower > upper)
+      return false;
+    if (reference_)
+    {
+      ++diagnostics_.reuse_attempts;
+      auto guide = referenceGuide(points, first, last);
+      if (!guide.empty() && addGuideAnchors(points, first, last, lower, upper, guide))
+      {
+        ++diagnostics_.reuse_successes;
+        diagnostics_.reused_guides.push_back(std::move(guide));
+        return true;
+      }
+    }
+
+    ++diagnostics_.local_attempts;
+    const auto start = std::chrono::steady_clock::now();
+    vector<Eigen::Vector3d> guide;
+    const bool found = a_star_->search(points.col(first), points.col(last), guide);
+    diagnostics_.local_search_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    if (!found)
+    {
+      ++diagnostics_.local_failures;
+      return false;
+    }
+
+    ++diagnostics_.local_successes;
+    const bool assigned = addGuideAnchors(points, first, last, lower, upper, guide);
+    diagnostics_.local_guides.push_back(std::move(guide));
+    return assigned;
+  }
+
+  void BsplineOptimizer::appendSplineCollisions(const Eigen::MatrixXd &points,
+                                                vector<std::pair<int, int>> &segments, bool initial)
+  {
+    UniformBspline spline(points, order_, bspline_interval_);
+    const double step = collisionSampleStep(spline);
+    const double end = spline.getTimeSum();
+    int first_hit = -1, last_hit = -1;
+    bool collided = false;
+    auto append = [&] {
+      if (first_hit < 0)
+        return;
+      int first = std::max(0, first_hit - 1);
+      int last = std::min<int>(points.cols() - 1, last_hit + 2);
+      while (first > 0 && grid_map_->getInflateOccupancy(points.col(first)) != 0)
+        --first;
+      while (last + 1 < points.cols() && grid_map_->getInflateOccupancy(points.col(last)) != 0)
+        ++last;
+      segments.emplace_back(first, last);
+      first_hit = -1;
+    };
+    if (step > 0.0 && std::isfinite(end))
+      for (double t = 0.0;; t = std::min(t + step, end))
+      {
+        const Eigen::Vector3d point = spline.evaluateDeBoorT(t);
+        if (!point.allFinite() || grid_map_->getInflateOccupancy(point) != 0)
+        {
+          const int control = static_cast<int>(t / bspline_interval_) + 1;
+          if (first_hit < 0)
+            first_hit = control;
+          last_hit = control;
+          collided = true;
+        }
+        else
+          append();
+        if (t >= end)
+          break;
+      }
+    append();
+    if (initial && collided)
+      ++diagnostics_.initial_collisions;
+  }
+
   std::vector<std::pair<int, int>> BsplineOptimizer::initControlPoints(Eigen::MatrixXd &init_points, bool flag_first_init /*= true*/)
   {
 
@@ -504,8 +699,9 @@ namespace ego_planner
     // 标识片段的起点和终点是否找到
     bool flag_got_start = false, flag_got_end = false, flag_got_end_maybe = false;
     const int i_end = collisionCheckEndIndex(init_points.cols() - order_);
-    // 遍历所有点
-    for (int i = order_; i <= i_end; ++i)
+    // The reference-seeded path uses collisions on the continuous spline.
+    // Keep the legacy control polygon check for goals without a grid route.
+    for (int i = order_; !reference_ && i <= i_end; ++i)
     {
       // cout << " *" << i-1 << "*" ;
       //  相邻两个点之间进行线性插值并检测障碍物
@@ -569,31 +765,24 @@ namespace ego_planner
     //   cout << "segment_ids=" << segment_ids[i].first << " ~ " << segment_ids[i].second << endl;
     // }
 
-    // return in advance
-    if (segment_ids.size() == 0)
+    if (flag_first_init || reference_)
     {
-      vector<std::pair<int, int>> blank_ret;
-      return blank_ret;
+      vector<std::pair<int, int>> spline_segments;
+      appendSplineCollisions(init_points, spline_segments, flag_first_init);
+      segment_ids.insert(segment_ids.end(), spline_segments.begin(), spline_segments.end());
     }
-
-    /*** a star search ***/
-    // 在每个无障碍片段 segment_ids 的起点和终点之间寻找一条路径
-    vector<vector<Eigen::Vector3d>> a_star_pathes;
-    for (size_t i = 0; i < segment_ids.size(); ++i)
+    std::sort(segment_ids.begin(), segment_ids.end());
+    size_t count = 0;
+    for (const auto segment : segment_ids)
     {
-      // cout << "in=" << in.transpose() << " out=" << out.transpose() << endl;
-      Eigen::Vector3d in(init_points.col(segment_ids[i].first)), out(init_points.col(segment_ids[i].second));
-      if (a_star_->AstarSearch(/*(in-out).norm()/10+0.05*/ 0.1, in, out))
-      {
-        a_star_pathes.push_back(a_star_->getPath());
-      }
+      if (count && segment.first <= segment_ids[count - 1].second)
+        segment_ids[count - 1].second = std::max(segment_ids[count - 1].second, segment.second);
       else
-      {
-        RCLCPP_ERROR(rclcpp::get_logger("initControlPoints"), "a star error, force return!");
-        vector<std::pair<int, int>> blank_ret;
-        return blank_ret;
-      }
+        segment_ids[count++] = segment;
     }
+    segment_ids.resize(count);
+    if (segment_ids.empty())
+      return {};
 
     /*** calculate bounds ***/
     int id_low_bound, id_up_bound;
@@ -684,159 +873,12 @@ namespace ego_planner
     // Used for return
     vector<std::pair<int, int>> final_segment_ids;
 
-    /*** Assign data to each segment ***/
-    for (size_t i = 0; i < segment_ids.size(); i++)
+    for (size_t i = 0; i < segment_ids.size(); ++i)
     {
-      // step 1
-      // 遍历该段所有控制点的id，并将标志位置为false
-      for (int j = adjusted_segment_ids[i].first; j <= adjusted_segment_ids[i].second; ++j)
-        cps_.flag_temp[j] = false;
-
-      // step 2
-      // 初始化交点标记
-      int got_intersection_id = -1;
-      for (int j = segment_ids[i].first + 1; j < segment_ids[i].second; ++j)
-      {
-        // 计算控制点的方向向量
-        Eigen::Vector3d ctrl_pts_law(init_points.col(j + 1) - init_points.col(j - 1)), intersection_point;
-        // A*路径的中点
-        int Astar_id = a_star_pathes[i].size() / 2, last_Astar_id; // Let "Astar_id = id_of_the_most_far_away_Astar_point" will be better, but it needs more computation
-        // 路径点和控制点之间的点积，判断当前路径点在控制点方向 ctrl_pts_law 的哪一侧
-        double val = (a_star_pathes[i][Astar_id] - init_points.col(j)).dot(ctrl_pts_law), last_val = val;
-        while (Astar_id >= 0 && Astar_id < (int)a_star_pathes[i].size())
-        {
-          last_Astar_id = Astar_id;
-
-          // 根据 val 的正负决定 Astar_id 的移动方向
-          if (val >= 0)
-            --Astar_id;
-          else
-            ++Astar_id;
-
-          val = (a_star_pathes[i][Astar_id] - init_points.col(j)).dot(ctrl_pts_law);
-
-          if (val * last_val <= 0 && (abs(val) > 0 || abs(last_val) > 0)) // val = last_val = 0.0 is not allowed
-          {
-            // 寻找可能的交点，TODO:还没搞懂
-            intersection_point =
-                a_star_pathes[i][Astar_id] +
-                ((a_star_pathes[i][Astar_id] - a_star_pathes[i][last_Astar_id]) *
-                 (ctrl_pts_law.dot(init_points.col(j) - a_star_pathes[i][Astar_id]) / ctrl_pts_law.dot(a_star_pathes[i][Astar_id] - a_star_pathes[i][last_Astar_id])) // = t
-                );
-
-            // cout << "i=" << i << " j=" << j << " Astar_id=" << Astar_id << " last_Astar_id=" << last_Astar_id << " intersection_point = " << intersection_point.transpose() << endl;
-
-            got_intersection_id = j;
-            break;
-          }
-        }
-
-        if (got_intersection_id >= 0)
-        {
-          // 计算交点到控制点之间的距离
-          double length = (intersection_point - init_points.col(j)).norm();
-          if (length > 1e-5)
-          {
-            cps_.flag_temp[j] = true;
-            // 逐步进行采样
-            for (double a = length; a >= 0.0; a -= grid_map_->getResolution())
-            {
-              // 通过线性插值计算采样点位置
-              occ = grid_map_->getInflateOccupancy((a / length) * intersection_point + (1 - a / length) * init_points.col(j));
-
-              if (occ || a < grid_map_->getResolution())
-              {
-                if (occ)
-                  a += grid_map_->getResolution();
-                // 记录基点并计算到控制点的方向
-                cps_.base_point[j].push_back((a / length) * intersection_point + (1 - a / length) * init_points.col(j));
-                cps_.direction[j].push_back((intersection_point - init_points.col(j)).normalized());
-                // cout << "A " << j << endl;
-                break;
-              }
-            }
-          }
-          else
-          {
-            got_intersection_id = -1;
-          }
-        }
-      }
-
-      /* Corner case: the segment length is too short. Here the control points may outside the A* path, leading to opposite gradient direction. So I have to take special care of it */
-      // 当轨迹片段只有两个控制点（即长度过短）时，A* 路径的方向可能与控制点的方向不一致，导致梯度方向相反
-      if (segment_ids[i].second - segment_ids[i].first == 1)
-      {
-        // 计算控制点方向向量和中点
-        Eigen::Vector3d ctrl_pts_law(init_points.col(segment_ids[i].second) - init_points.col(segment_ids[i].first)), intersection_point;
-        Eigen::Vector3d middle_point = (init_points.col(segment_ids[i].second) + init_points.col(segment_ids[i].first)) / 2;
-        // 计算A*中点并判断方向，同上
-        int Astar_id = a_star_pathes[i].size() / 2, last_Astar_id; // Let "Astar_id = id_of_the_most_far_away_Astar_point" will be better, but it needs more computation
-        double val = (a_star_pathes[i][Astar_id] - middle_point).dot(ctrl_pts_law), last_val = val;
-        while (Astar_id >= 0 && Astar_id < (int)a_star_pathes[i].size())
-        {
-          last_Astar_id = Astar_id;
-
-          if (val >= 0)
-            --Astar_id;
-          else
-            ++Astar_id;
-
-          // 和上面不一样，这里减去的是中点
-          val = (a_star_pathes[i][Astar_id] - middle_point).dot(ctrl_pts_law);
-
-          if (val * last_val <= 0 && (abs(val) > 0 || abs(last_val) > 0)) // val = last_val = 0.0 is not allowed
-          {
-            // 计算交点
-            intersection_point =
-                a_star_pathes[i][Astar_id] +
-                ((a_star_pathes[i][Astar_id] - a_star_pathes[i][last_Astar_id]) *
-                 (ctrl_pts_law.dot(middle_point - a_star_pathes[i][Astar_id]) / ctrl_pts_law.dot(a_star_pathes[i][Astar_id] - a_star_pathes[i][last_Astar_id])) // = t
-                );
-
-            // 满足距离要求则存储相关信息
-            if ((intersection_point - middle_point).norm() > 0.01) // 1cm.
-            {
-              cps_.flag_temp[segment_ids[i].first] = true;
-              cps_.base_point[segment_ids[i].first].push_back(init_points.col(segment_ids[i].first));
-              cps_.direction[segment_ids[i].first].push_back((intersection_point - middle_point).normalized());
-
-              got_intersection_id = segment_ids[i].first;
-            }
-            break;
-          }
-        }
-      }
-
-      // step 3
-      if (got_intersection_id >= 0)
-      {
-        // 遍历交点之后的控制点
-        for (int j = got_intersection_id + 1; j <= adjusted_segment_ids[i].second; ++j)
-          // 如果没被标记则将前一个控制点的信息给该点
-          if (!cps_.flag_temp[j])
-          {
-            cps_.base_point[j].push_back(cps_.base_point[j - 1].back());
-            cps_.direction[j].push_back(cps_.direction[j - 1].back());
-            // cout << "AAA " << j << endl;
-          }
-
-        // 遍历交点前的控制点，如果没被标记用后一个控制点的数据赋值
-        for (int j = got_intersection_id - 1; j >= adjusted_segment_ids[i].first; --j)
-          if (!cps_.flag_temp[j])
-          {
-            cps_.base_point[j].push_back(cps_.base_point[j + 1].back());
-            cps_.direction[j].push_back(cps_.direction[j + 1].back());
-            // cout << "AAAA " << j << endl;
-          }
-
+      const auto [first, last] = segment_ids[i];
+      const auto [lower, upper] = adjusted_segment_ids[i];
+      if (assignCollisionGuide(init_points, first, last, lower, upper))
         final_segment_ids.push_back(adjusted_segment_ids[i]);
-      }
-      else
-      {
-        // Just ignore, it does not matter ^_^.
-        // ROS_ERROR("Failed to generate direction! segment_id=%d", i);
-      }
     }
 
     return final_segment_ids;
@@ -1399,23 +1441,6 @@ namespace ego_planner
 
     if (flag_new_obs_valid)
     {
-      vector<vector<Eigen::Vector3d>> a_star_pathes;
-      for (size_t i = 0; i < segment_ids.size(); ++i)
-      {
-        /*** a star search ***/
-        Eigen::Vector3d in(cps_.points.col(segment_ids[i].first)), out(cps_.points.col(segment_ids[i].second));
-        if (a_star_->AstarSearch(/*(in-out).norm()/10+0.05*/ 0.1, in, out))
-        {
-          a_star_pathes.push_back(a_star_->getPath());
-        }
-        else
-        {
-          RCLCPP_ERROR(rclcpp::get_logger("check_collision_and_rebound"), "a star error");
-          segment_ids.erase(segment_ids.begin() + i);
-          i--;
-        }
-      }
-
       for (size_t i = 1; i < segment_ids.size(); i++) // Avoid overlap
       {
         if (segment_ids[i - 1].second >= segment_ids[i].first)
@@ -1426,93 +1451,9 @@ namespace ego_planner
         }
       }
 
-      /*** Assign parameters to each segment ***/
-      for (size_t i = 0; i < segment_ids.size(); ++i)
-      {
-        // step 1
-        for (int j = segment_ids[i].first; j <= segment_ids[i].second; ++j)
-          cps_.flag_temp[j] = false;
-
-        // step 2
-        int got_intersection_id = -1;
-        for (int j = segment_ids[i].first + 1; j < segment_ids[i].second; ++j)
-        {
-          Eigen::Vector3d ctrl_pts_law(cps_.points.col(j + 1) - cps_.points.col(j - 1)), intersection_point;
-          int Astar_id = a_star_pathes[i].size() / 2, last_Astar_id; // Let "Astar_id = id_of_the_most_far_away_Astar_point" will be better, but it needs more computation
-          double val = (a_star_pathes[i][Astar_id] - cps_.points.col(j)).dot(ctrl_pts_law), last_val = val;
-          while (Astar_id >= 0 && Astar_id < (int)a_star_pathes[i].size())
-          {
-            last_Astar_id = Astar_id;
-
-            if (val >= 0)
-              --Astar_id;
-            else
-              ++Astar_id;
-
-            val = (a_star_pathes[i][Astar_id] - cps_.points.col(j)).dot(ctrl_pts_law);
-
-            // cout << val << endl;
-
-            if (val * last_val <= 0 && (abs(val) > 0 || abs(last_val) > 0)) // val = last_val = 0.0 is not allowed
-            {
-              intersection_point =
-                  a_star_pathes[i][Astar_id] +
-                  ((a_star_pathes[i][Astar_id] - a_star_pathes[i][last_Astar_id]) *
-                   (ctrl_pts_law.dot(cps_.points.col(j) - a_star_pathes[i][Astar_id]) / ctrl_pts_law.dot(a_star_pathes[i][Astar_id] - a_star_pathes[i][last_Astar_id])) // = t
-                  );
-
-              got_intersection_id = j;
-              break;
-            }
-          }
-
-          if (got_intersection_id >= 0)
-          {
-            double length = (intersection_point - cps_.points.col(j)).norm();
-            if (length > 1e-5)
-            {
-              cps_.flag_temp[j] = true;
-              for (double a = length; a >= 0.0; a -= grid_map_->getResolution())
-              {
-                bool occ = grid_map_->getInflateOccupancy((a / length) * intersection_point + (1 - a / length) * cps_.points.col(j));
-
-                if (occ || a < grid_map_->getResolution())
-                {
-                  if (occ)
-                    a += grid_map_->getResolution();
-                  cps_.base_point[j].push_back((a / length) * intersection_point + (1 - a / length) * cps_.points.col(j));
-                  cps_.direction[j].push_back((intersection_point - cps_.points.col(j)).normalized());
-                  break;
-                }
-              }
-            }
-            else
-            {
-              got_intersection_id = -1;
-            }
-          }
-        }
-
-        // step 3
-        if (got_intersection_id >= 0)
-        {
-          for (int j = got_intersection_id + 1; j <= segment_ids[i].second; ++j)
-            if (!cps_.flag_temp[j])
-            {
-              cps_.base_point[j].push_back(cps_.base_point[j - 1].back());
-              cps_.direction[j].push_back(cps_.direction[j - 1].back());
-            }
-
-          for (int j = got_intersection_id - 1; j >= segment_ids[i].first; --j)
-            if (!cps_.flag_temp[j])
-            {
-              cps_.base_point[j].push_back(cps_.base_point[j + 1].back());
-              cps_.direction[j].push_back(cps_.direction[j + 1].back());
-            }
-        }
-        else
-          RCLCPP_WARN(rclcpp::get_logger("check_collision_and_rebound"), "Failed to generate direction. It doesn't matter.");
-      }
+      for (const auto &[first, last] : segment_ids)
+        if (!assignCollisionGuide(cps_.points, first, last, first, last))
+          RCLCPP_DEBUG(rclcpp::get_logger("check_collision_and_rebound"), "No compatible collision guide");
 
       force_stop_type_ = STOP_FOR_REBOUND;
       return true;
@@ -1571,18 +1512,27 @@ namespace ego_planner
     return end - static_cast<int>((1.0 - collision_check_fraction_) * std::max(0, end - order_));
   }
 
-  bool BsplineOptimizer::firstCollision(UniformBspline &trajectory, double &time)
+  double BsplineOptimizer::collisionSampleStep(UniformBspline &trajectory) const
   {
-    const double end = trajectory.getTimeSum() * collision_check_fraction_;
-    const auto velocity = trajectory.getDerivative();
-    const double speed_bound = velocity.getMaxControlPointNorm();
-    if (!std::isfinite(end) || end < 0.0 || !std::isfinite(speed_bound))
+    const double speed = trajectory.getDerivative().getMaxControlPointNorm();
+    return std::isfinite(speed) ? 0.5 * grid_map_->getResolution() / std::max(speed, 1e-6) : 0.0;
+  }
+
+  bool BsplineOptimizer::trajectoryInCollision(UniformBspline &trajectory)
+  {
+    double time;
+    return firstCollision(trajectory, time, 1.0);
+  }
+
+  bool BsplineOptimizer::firstCollision(UniformBspline &trajectory, double &time, double fraction)
+  {
+    const double end = trajectory.getTimeSum() * fraction;
+    const double step = collisionSampleStep(trajectory);
+    if (!std::isfinite(end) || end < 0.0 || step <= 0.0)
     {
       time = 0.0;
       return true;
     }
-    // Bound the distance between samples using the derivative control points.
-    const double step = 0.5 * grid_map_->getResolution() / std::max(speed_bound, 1e-6);
     for (time = 0.0;; time = std::min(time + step, end))
     {
       const Eigen::Vector3d position = trajectory.evaluateDeBoorT(time);
@@ -1663,7 +1613,7 @@ namespace ego_planner
         /*** collision check, phase 2 ***/
         UniformBspline traj(cps_.points, 3, bspline_interval_);
         double collision_time;
-        flag_occ = firstCollision(traj, collision_time);
+        flag_occ = firstCollision(traj, collision_time, collision_check_fraction_);
         if (flag_occ && collision_time <= bspline_interval_)
         {
           RCLCPP_WARN(rclcpp::get_logger("rebound_optimize"),
@@ -1794,7 +1744,7 @@ namespace ego_planner
 
       UniformBspline traj(cps_.points, 3, bspline_interval_);
       double collision_time;
-      flag_safe = !firstCollision(traj, collision_time);
+      flag_safe = !firstCollision(traj, collision_time, collision_check_fraction_);
 
       // 如果存在碰撞则调整参数并重新迭代
       if (!flag_safe)

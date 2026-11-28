@@ -226,7 +226,13 @@ public:
                       std::vector<Eigen::Vector3d> &path, bool exact = false,
                       std::chrono::steady_clock::time_point deadline =
                         std::chrono::steady_clock::time_point::max(),
-                      bool *search_limit_hit = nullptr);
+                      bool *search_limit_hit = nullptr,
+                      std::vector<Eigen::Vector3d> *raw_path = nullptr);
+  bool searchLocalPath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
+                       std::vector<Eigen::Vector3d> &path,
+                       std::chrono::steady_clock::time_point deadline);
+  float segmentCost(const Eigen::Vector3d &a, const Eigen::Vector3d &b, bool known_free,
+                    const Eigen::Vector3i *escape_voxel = nullptr);
   typedef std::shared_ptr<GridMap> Ptr;
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -237,6 +243,10 @@ private:
   std::vector<float> clearance_cost_;
   std::vector<int> clearance_obstacles_;
   void updateSoftClearance();
+  bool searchPath(const Eigen::Vector3d &start, const Eigen::Vector3d &goal,
+                  std::vector<Eigen::Vector3d> &path, bool exact,
+                  std::chrono::steady_clock::time_point deadline, bool *search_limit_hit,
+                  std::vector<Eigen::Vector3d> *raw_path, bool local);
 
   // get depth image and camera pose
   void depthPoseCallback(const sensor_msgs::msg::Image::ConstPtr &img,
