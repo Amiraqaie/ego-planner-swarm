@@ -20,7 +20,7 @@ namespace ego_planner
   public:
     PolynomialTraj global_traj_;
     vector<Eigen::Vector3d> raw_route_, simplified_route_;
-    vector<double> raw_times_, local_knot_reference_times_;
+    vector<double> raw_times_, simplified_times_, local_knot_reference_times_;
     bool polynomial_clear_ = false;
     Eigen::Vector3d progress_position_ = Eigen::Vector3d::Zero();
     double local_reference_start_ = 0.0;
@@ -28,19 +28,24 @@ namespace ego_planner
 
     bool hasGridRoute() const { return raw_times_.size() >= 2; }
 
-    size_t rawEdge(double t) const
+    static size_t routeEdge(const vector<double> &times, double t)
     {
-      auto next = std::upper_bound(raw_times_.begin(), raw_times_.end(), t);
-      return std::clamp<size_t>(next - raw_times_.begin(), 1, raw_times_.size() - 1);
+      const auto next = std::upper_bound(times.begin(), times.end(), t);
+      return std::clamp<size_t>(next - times.begin(), 1, times.size() - 1);
     }
+
+    size_t rawEdge(double t) const { return routeEdge(raw_times_, t); }
+    bool usesSimplifiedReference() const { return !polynomial_clear_ && !simplified_times_.empty(); }
 
     Eigen::Vector3d referencePosition(double t)
     {
       if (!hasGridRoute() || polynomial_clear_)
         return getPosition(t);
-      const size_t edge = rawEdge(t);
-      const double u = (t - raw_times_[edge - 1]) / (raw_times_[edge] - raw_times_[edge - 1]);
-      return raw_route_[edge - 1] + std::clamp(u, 0.0, 1.0) * (raw_route_[edge] - raw_route_[edge - 1]);
+      const auto &points = usesSimplifiedReference() ? simplified_route_ : raw_route_;
+      const auto &times = usesSimplifiedReference() ? simplified_times_ : raw_times_;
+      const size_t edge = routeEdge(times, t);
+      const double u = (t - times[edge - 1]) / (times[edge] - times[edge - 1]);
+      return points[edge - 1] + std::clamp(u, 0.0, 1.0) * (points[edge] - points[edge - 1]);
     }
 
     Eigen::Vector3d referenceVelocity(double t)
@@ -49,8 +54,10 @@ namespace ego_planner
         return getVelocity(t);
       if (t >= global_duration_)
         return Eigen::Vector3d::Zero();
-      const size_t edge = rawEdge(t);
-      return (raw_route_[edge] - raw_route_[edge - 1]) / (raw_times_[edge] - raw_times_[edge - 1]);
+      const auto &points = usesSimplifiedReference() ? simplified_route_ : raw_route_;
+      const auto &times = usesSimplifiedReference() ? simplified_times_ : raw_times_;
+      const size_t edge = routeEdge(times, t);
+      return (points[edge] - points[edge - 1]) / (times[edge] - times[edge - 1]);
     }
 
     Eigen::Vector3d referenceAcceleration(double t)
@@ -91,6 +98,7 @@ namespace ego_planner
       raw_route_.clear();
       simplified_route_.clear();
       raw_times_.clear();
+      simplified_times_.clear();
       local_knot_reference_times_.clear();
       polynomial_clear_ = false;
     }

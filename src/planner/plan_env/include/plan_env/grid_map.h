@@ -317,7 +317,11 @@ private:
   Eigen::Vector2d ceiling_origin_ = Eigen::Vector2d::Zero();
   std::chrono::steady_clock::time_point last_ceiling_check_{};
   int ceiling_confirmations_ = 0;
-  void updateDisplayCeiling();
+  std::optional<double> floor_height_, pending_floor_;
+  Eigen::Vector2d floor_origin_ = Eigen::Vector2d::Zero();
+  int floor_confirmations_ = 0;
+  void updateDisplayCeiling(bool detect_floor);
+  std::optional<double> findDisplaySlab(const Eigen::Vector3d &position, bool ceiling);
 
   rclcpp::TimerBase::SharedPtr occ_timer_;
   rclcpp::TimerBase::SharedPtr vis_timer_;

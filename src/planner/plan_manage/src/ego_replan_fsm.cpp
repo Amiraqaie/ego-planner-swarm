@@ -240,12 +240,18 @@ namespace ego_planner
       exact_global_goal_ = exact;
       end_pt_ = next_wp;
 
-      constexpr double step_size_t = 0.1;
-      int i_end = floor(planner_manager_->global_data_.global_duration_ / step_size_t);
-      vector<Eigen::Vector3d> gloabl_traj(i_end);
-      for (int i = 0; i < i_end; i++)
+      auto &reference = planner_manager_->global_data_;
+      vector<Eigen::Vector3d> global_path;
+      if (reference.hasGridRoute() && !reference.polynomial_clear_)
       {
-        gloabl_traj[i] = planner_manager_->global_data_.referencePosition(i * step_size_t);
+        global_path = reference.usesSimplifiedReference() ? reference.simplified_route_ : reference.raw_route_;
+      }
+      else
+      {
+        constexpr double step_size_t = 0.1;
+        for (double t = 0.0; t < reference.global_duration_; t += step_size_t)
+          global_path.push_back(reference.referencePosition(t));
+        global_path.push_back(reference.referencePosition(reference.global_duration_));
       }
 
       end_vel_.setZero();
@@ -294,7 +300,7 @@ namespace ego_planner
         changeFSMExecState(REPLAN_TRAJ, "TRIG");
       }
 
-      visualization_->displayGlobalPathList(gloabl_traj, 0.1, 0);
+      visualization_->displayGlobalPathList(global_path, 0.1, 0);
     }
     else
     {

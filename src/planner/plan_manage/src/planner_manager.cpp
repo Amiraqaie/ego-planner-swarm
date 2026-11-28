@@ -64,8 +64,11 @@ namespace ego_planner
         arc.push_back(arc.back() + distance);
       }
     };
-    for (size_t i = route.rawEdge(begin); i < route.raw_times_.size() && route.raw_times_[i] < finish; ++i)
-      append(route.raw_route_[i], route.raw_times_[i]);
+    const auto &positions = route.usesSimplifiedReference() ? route.simplified_route_ : route.raw_route_;
+    const auto &waypoint_times = route.usesSimplifiedReference() ? route.simplified_times_ : route.raw_times_;
+    for (size_t i = GlobalTrajData::routeEdge(waypoint_times, begin);
+         i < waypoint_times.size() && waypoint_times[i] < finish; ++i)
+      append(positions[i], waypoint_times[i]);
     append(end, finish);
     if (points.size() < 2 || !std::isfinite(arc.back()))
       return false;
@@ -563,7 +566,7 @@ namespace ego_planner
 
     // Shortcut points are an ordered subsequence of the raw lattice route.
     // Map each raw arc to the corresponding polynomial waypoint times.
-    vector<double> raw_times(raw_route.size(), 0.0);
+    vector<double> raw_times(raw_route.size(), 0.0), simplified_times{0.0};
     size_t raw_begin = 0;
     double from = 0.0;
     for (size_t wp = 1; wp < points.size(); ++wp)
@@ -584,6 +587,7 @@ namespace ego_planner
       for (size_t i = raw_begin + 1; i <= raw_end; ++i)
         raw_times[i] = from + raw_times[i] / arc * duration;
       from += duration;
+      simplified_times.push_back(from);
       raw_begin = raw_end;
     }
     if (raw_begin + 1 != raw_route.size())
@@ -592,23 +596,33 @@ namespace ego_planner
     // A free waypoint sequence can still yield a polynomial that cuts a corner.
     gl_traj.init();
     const bool polynomial_clear = validateGlobalPolynomial(gl_traj, start_pos);
-    if (!polynomial_clear)
-    {
-      Eigen::Vector3i start_voxel;
-      grid_map_->posToIndex(start_pos, start_voxel);
-      for (size_t i = 1; i < raw_route.size(); ++i)
-        if (!std::isfinite(grid_map_->segmentCost(raw_route[i - 1], raw_route[i], true, &start_voxel)))
+    Eigen::Vector3i start_voxel;
+    grid_map_->posToIndex(start_pos, start_voxel);
+    const auto clear = [&](const vector<Eigen::Vector3d> &route) {
+      for (size_t i = 1; i < route.size(); ++i)
+        if (!std::isfinite(grid_map_->segmentCost(route[i - 1], route[i], true, &start_voxel)))
           return false;
-    }
+      return true;
+    };
+    const bool simplified_clear = !polynomial_clear && clear(points);
+    if (!polynomial_clear && !simplified_clear && !clear(raw_route))
+      return false;
     global_data_.setGlobalTraj(gl_traj, rclcpp::Clock().now());
     global_data_.raw_route_ = raw_route;
     global_data_.simplified_route_ = std::move(points);
     raw_times.back() = global_data_.global_duration_;
     global_data_.raw_times_ = std::move(raw_times);
+    if (simplified_clear)
+    {
+      simplified_times.back() = global_data_.global_duration_;
+      global_data_.simplified_times_ = std::move(simplified_times);
+    }
     global_data_.polynomial_clear_ = polynomial_clear;
     global_data_.progress_position_ = start_pos;
     if (!polynomial_clear)
-      RCLCPP_WARN(rclcpp::get_logger("ego_planner"), "Global polynomial intersects blocked space; using the raw A* route as reference");
+      RCLCPP_WARN(rclcpp::get_logger("ego_planner"),
+                  "Global polynomial intersects blocked space; using %s A* route as reference",
+                  simplified_clear ? "the validated simplified" : "the raw");
 
     return true;
   }
