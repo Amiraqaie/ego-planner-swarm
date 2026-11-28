@@ -18,6 +18,9 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/local_update_range_y", -1.0);
   node_->declare_parameter("grid_map/local_update_range_z", -1.0);
   node_->declare_parameter("grid_map/obstacles_inflation", -1.0);
+  const double z_inflation = node_->declare_parameter("grid_map/octomap_z_inflation", 0.2);
+  if (!std::isfinite(z_inflation) || z_inflation < 0.0)
+    throw std::invalid_argument("grid_map/octomap_z_inflation must be finite and nonnegative");
   node_->declare_parameter("grid_map/fx", -1.0);
   node_->declare_parameter("grid_map/fy", -1.0);
   node_->declare_parameter("grid_map/cx", -1.0);
@@ -1406,9 +1409,11 @@ void GridMap::freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedP
     return;
   }
 
+  const double z_inflation = node_->get_parameter("grid_map/octomap_z_inflation").as_double();
   if (usesOctomapBounds())
   {
-    const auto bounds = plan_env::octomapBounds(*tree, mp_.resolution_, mp_.obstacles_inflation_);
+    const double padding = std::max(mp_.obstacles_inflation_, z_inflation);
+    const auto bounds = plan_env::octomapBounds(*tree, mp_.resolution_, padding);
     bool usable = bounds.has_value();
     if (usable && (bounds->origin != mp_.map_origin_ || bounds->cells != mp_.map_voxel_num_))
     {
@@ -1451,7 +1456,8 @@ void GridMap::freeOctomapCallback(const octomap_msgs::msg::Octomap::ConstSharedP
 
   constexpr double index_epsilon = 1e-3;
   const int inflate_xy = std::max(0, static_cast<int>(std::ceil(mp_.obstacles_inflation_ * mp_.resolution_inv_)));
-  const Eigen::Vector3i inflation(inflate_xy, inflate_xy, inflate_xy > 0 ? 1 : 0);
+  const int inflate_z = static_cast<int>(std::ceil(z_inflation * mp_.resolution_inv_));
+  const Eigen::Vector3i inflation(inflate_xy, inflate_xy, inflate_z);
   auto fillBox = [&](auto &buffer, const Eigen::Vector3i &lo, const Eigen::Vector3i &hi, auto value) {
     for (int x = lo.x(); x <= hi.x(); ++x)
       for (int y = lo.y(); y <= hi.y(); ++y)
