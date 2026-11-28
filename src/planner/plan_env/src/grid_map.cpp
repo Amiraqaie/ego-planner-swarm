@@ -1790,32 +1790,39 @@ void GridMap::updateDisplayFloor()
         std::isfinite(nominal) && nominal >= 0.8 ? nominal : 3.0);
     const auto observed_floor = findDisplaySlab(position, false);
     auto floor = observed_floor;
-    if (floor && !floor_height_ && ceiling_height_ &&
-        position.z() >= *ceiling_height_ + slab_tolerance &&
-        *floor < *ceiling_height_ - slab_tolerance)
-      floor.reset(); // A gap can expose the previous floor through the stairs.
-    if (floor && floor_height_)
+    auto active_floor_before = floor_height_;
+    if (!active_floor_before && ceiling_height_)
+      active_floor_before = *ceiling_height_ - room_height;
+
+    bool descending = false;
+    bool ascending = false;
+    if (floor && active_floor_before)
     {
-      const double difference = *floor - *floor_height_;
-      const bool above_current = difference >= min_floor_change &&
+      const double difference = *floor - *active_floor_before;
+      ascending = difference >= min_floor_change &&
           (!ceiling_height_ || position.z() > *ceiling_height_ - slab_tolerance);
-      const bool below_current = difference <= -min_floor_change &&
-          position.z() < *floor_height_ + slab_tolerance;
-      if (!above_current && !below_current)
+      descending = difference <= -min_floor_change &&
+          position.z() < *active_floor_before + slab_tolerance;
+      const bool matches_provisional = !floor_height_ && std::abs(difference) < min_floor_change &&
+          position.z() >= *active_floor_before - slab_tolerance &&
+          (!ceiling_height_ || position.z() < *ceiling_height_ + slab_tolerance);
+      if (!ascending && !descending && !matches_provisional)
         floor.reset();
     }
 
     if (confirmed(floor, pending_floor_, floor_confirmations_))
     {
-      const bool changed_floor = floor_height_.has_value() ||
-          (ceiling_height_ && *floor >= *ceiling_height_ - slab_tolerance);
       floor_height_ = floor;
-      if (changed_floor)
+      if (ascending || descending)
       {
-        // Transfer the last measured floor-to-ceiling distance to the new
-        // floor. It stays available even when the OctoMap has a ceiling gap.
+        // Move both bounds together. On descent the previous floor slab
+        // also bounds the new room from above.
+        double new_ceiling = *floor_height_ + room_height;
+        if (descending && active_floor_before &&
+            *active_floor_before - *floor_height_ >= 0.8)
+          new_ceiling = std::min(new_ceiling, *active_floor_before);
+        ceiling_height_ = new_ceiling;
         ceiling_inferred_ = true;
-        ceiling_height_ = *floor_height_ + room_height;
         pending_ceiling_.reset();
         ceiling_confirmations_ = 0;
       }
@@ -1824,7 +1831,12 @@ void GridMap::updateDisplayFloor()
     auto ceiling = findDisplaySlab(position, true);
     const bool on_active_floor = floor_height_ && observed_floor &&
         std::abs(*floor_height_ - *observed_floor) <= slab_tolerance;
+    // A locally observed ceiling can correct an estimate. A much higher
+    // slab seen through the stairs belongs to a different floor.
     const bool can_correct_inferred = ceiling_inferred_ && on_active_floor;
+    if (ceiling && ceiling_height_ && can_correct_inferred &&
+        *ceiling - *ceiling_height_ > std::max(1.1, 0.4 * room_height))
+      ceiling.reset();
     const bool above_active = ceiling_height_ && !can_correct_inferred &&
         position.z() >= *ceiling_height_ + slab_tolerance;
     const double active_floor = floor_height_.value_or(
