@@ -477,14 +477,16 @@ namespace ego_planner
 
       double ratio;
       bool flag_step_2_success = true;
-      if (!pos.checkFeasibility(ratio, false))
+      const int refinement_attempts = from_reference ? 4 : 1;
+      for (int attempt = 0; attempt < refinement_attempts && !pos.checkFeasibility(ratio, false); ++attempt)
       {
-        cout << "Need to reallocate time." << endl;
-
         Eigen::MatrixXd optimal_control_points;
-        flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points);
-        if (flag_step_2_success)
-          pos = UniformBspline(optimal_control_points, 3, ts);
+        const double stretch = from_reference ? std::max(1.06, 1.04 * ratio) : ratio;
+        flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, stretch, ts, optimal_control_points);
+        if (!flag_step_2_success)
+          break;
+        pos = UniformBspline(optimal_control_points, 3, ts);
+        pos.setPhysicalLimits(pp_.max_vel_, pp_.max_acc_, pp_.feasibility_tolerance_);
       }
 
       if (!flag_step_2_success)
@@ -852,16 +854,17 @@ namespace ego_planner
     const Eigen::Vector3d end_position = bspline.evaluateDeBoorT(time_origin);
     int seg_num = bspline.getControlPoint().cols() - 3;
 
-    bspline.lengthenTime(ratio);
-    double duration = bspline.getTimeSum();
+    const bool from_reference = global_data_.hasGridRoute();
+    if (!from_reference)
+      bspline.lengthenTime(ratio);
+    const double sample_duration = bspline.getTimeSum();
+    const double duration = from_reference ? time_origin * ratio : sample_duration;
     dt = duration / double(seg_num);
     time_inc = duration - time_origin;
 
     vector<Eigen::Vector3d> point_set;
-    for (double time = 0.0; time <= duration + 1e-4; time += dt)
-    {
-      point_set.push_back(bspline.evaluateDeBoorT(time));
-    }
+    for (int i = 0; i <= seg_num; ++i)
+      point_set.push_back(bspline.evaluateDeBoorT(sample_duration * i / seg_num));
     UniformBspline::parameterizeToBspline(dt, point_set, start_end_derivative, ctrl_pts);
     if (global_data_.hasGridRoute())
     {
