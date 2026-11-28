@@ -316,6 +316,15 @@ private:
   std::optional<double> ceiling_height_, pending_ceiling_;
   std::optional<double> confirmed_room_height_;
   bool ceiling_inferred_ = false;
+  struct DisplayFloorBand
+  {
+    std::optional<double> floor;
+    double ceiling;
+    double estimated_floor;
+    bool inferred_ceiling;
+  };
+  std::optional<DisplayFloorBand> previous_display_floor_;
+  int previous_floor_confirmations_ = 0;
   std::chrono::steady_clock::time_point last_ceiling_check_{};
   int ceiling_confirmations_ = 0;
   std::optional<double> floor_height_, pending_floor_;

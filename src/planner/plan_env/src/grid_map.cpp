@@ -1794,6 +1794,11 @@ void GridMap::updateDisplayFloor()
     if (!active_floor_before && ceiling_height_)
       active_floor_before = *ceiling_height_ - room_height;
 
+    const auto active_band_before = ceiling_height_ && active_floor_before
+        ? std::optional<DisplayFloorBand>(DisplayFloorBand{
+            floor_height_, *ceiling_height_, *active_floor_before, ceiling_inferred_})
+        : std::nullopt;
+    bool switched = false;
     bool descending = false;
     bool ascending = false;
     if (floor && active_floor_before)
@@ -1815,6 +1820,7 @@ void GridMap::updateDisplayFloor()
       floor_height_ = floor;
       if (ascending || descending)
       {
+        switched = true;
         // Move both bounds together. On descent the previous floor slab
         // also bounds the new room from above.
         double new_ceiling = *floor_height_ + room_height;
@@ -1858,6 +1864,7 @@ void GridMap::updateDisplayFloor()
     {
       if (switch_by_ceiling)
       {
+        switched = true;
         floor_height_.reset();
         pending_floor_.reset();
         floor_confirmations_ = 0;
@@ -1866,6 +1873,35 @@ void GridMap::updateDisplayFloor()
       ceiling_inferred_ = false;
       if (floor_height_ && *ceiling_height_ - *floor_height_ >= 0.8)
         confirmed_room_height_ = *ceiling_height_ - *floor_height_;
+    }
+
+    const bool inside_previous = previous_display_floor_ && (above_active || below_active) &&
+        position.z() > previous_display_floor_->estimated_floor + slab_tolerance &&
+        position.z() < previous_display_floor_->ceiling - slab_tolerance &&
+        isKnownFreePosition(position);
+    if (!switched && inside_previous)
+    {
+      // Returning to the previous mapped level does not require the landing
+      // or ceiling to be visible again from inside the stairwell.
+      if (++previous_floor_confirmations_ >= 3)
+      {
+        floor_height_ = previous_display_floor_->floor;
+        ceiling_height_ = previous_display_floor_->ceiling;
+        ceiling_inferred_ = previous_display_floor_->inferred_ceiling;
+        pending_floor_.reset();
+        pending_ceiling_.reset();
+        floor_confirmations_ = ceiling_confirmations_ = 0;
+        switched = true;
+      }
+    }
+    else
+    {
+      previous_floor_confirmations_ = 0;
+    }
+    if (switched)
+    {
+      previous_display_floor_ = active_band_before;
+      previous_floor_confirmations_ = 0;
     }
   }
 
