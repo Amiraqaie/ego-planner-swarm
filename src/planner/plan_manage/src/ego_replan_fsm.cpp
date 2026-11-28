@@ -142,16 +142,14 @@ namespace ego_planner
             std::string reason, frontier_status;
             response->plan = previewGoal(request->goal, request->tolerance, reason, frontier_status);
           });
-#ifdef NGD_GOAL_PREVIEW
-      goal_check_service_ = node_->create_service<ngd_ros_wrapper::srv::PreviewGoal>(
+      goal_check_service_ = node_->create_service<ego_planner_interfaces::srv::PreviewGoal>(
           "/ego/check_goal",
-          [this](const std::shared_ptr<ngd_ros_wrapper::srv::PreviewGoal::Request> request,
-                 std::shared_ptr<ngd_ros_wrapper::srv::PreviewGoal::Response> response)
+          [this](const std::shared_ptr<ego_planner_interfaces::srv::PreviewGoal::Request> request,
+                 std::shared_ptr<ego_planner_interfaces::srv::PreviewGoal::Response> response)
           {
             response->plan = previewGoal(request->goal, request->tolerance,
                                          response->rejection_reason, response->frontier_status);
           });
-#endif
       waypoint_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
           goal_topic,        // was "/move_base_simple/goal"
           1,

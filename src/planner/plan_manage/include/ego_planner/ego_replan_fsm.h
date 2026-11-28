@@ -8,9 +8,7 @@
 #include <iostream>
 #include "nav_msgs/msg/path.hpp"
 #include "nav_msgs/srv/get_plan.hpp"
-#ifdef NGD_GOAL_PREVIEW
-#include "ngd_ros_wrapper/srv/preview_goal.hpp"
-#endif
+#include "ego_planner_interfaces/srv/preview_goal.hpp"
 #include "geometry_msgs/msg/pose_array.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "sensor_msgs/msg/imu.hpp"
@@ -107,9 +105,7 @@ namespace ego_planner
     geometry_msgs::msg::PoseArray::ConstSharedPtr frontier_centers_;
     std::chrono::steady_clock::time_point frontier_received_;
     rclcpp::Service<nav_msgs::srv::GetPlan>::SharedPtr goal_preview_service_;
-#ifdef NGD_GOAL_PREVIEW
-    rclcpp::Service<ngd_ros_wrapper::srv::PreviewGoal>::SharedPtr goal_check_service_;
-#endif
+    rclcpp::Service<ego_planner_interfaces::srv::PreviewGoal>::SharedPtr goal_check_service_;
     rclcpp::Subscription<traj_utils::msg::MultiBsplines>::SharedPtr swarm_trajs_sub_;
     rclcpp::Subscription<traj_utils::msg::Bspline>::SharedPtr broadcast_bspline_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr trigger_sub_;

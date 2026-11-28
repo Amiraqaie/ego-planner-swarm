@@ -20,7 +20,7 @@ find_package(quadrotor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 # When building the NGD image, source its host workspace to enable detailed goal checks.
-find_package(ngd_ros_wrapper QUIET)
+find_package(ego_planner_interfaces REQUIRED)
 find_package(plan_env REQUIRED)
 find_package(path_searching REQUIRED)
 find_package(bspline_opt REQUIRED)
@@ -71,10 +71,7 @@ ament_target_dependencies(ego_planner_node
                           octomap_msgs octomap
                           )
 
-if(ngd_ros_wrapper_FOUND)
-  ament_target_dependencies(ego_planner_node ngd_ros_wrapper)
-  target_compile_definitions(ego_planner_node PRIVATE NGD_GOAL_PREVIEW)
-endif()
+ament_target_dependencies(ego_planner_node ego_planner_interfaces)
 
 find_library(TRAJ_UTILS_LIB traj_utils_lib PATHS ${traj_utils_LIBRARY_DIRS})
 

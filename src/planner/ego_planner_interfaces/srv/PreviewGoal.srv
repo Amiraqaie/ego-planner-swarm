@@ -1,0 +1,10 @@
+# Check a goal without starting a flight. A zero tolerance checks the exact goal only.
+geometry_msgs/PoseStamped goal
+float32 tolerance
+---
+# Empty if neither the requested goal nor a frontier can be reached.
+nav_msgs/Path plan
+# Why the requested goal failed, even when the plan leads to a frontier.
+string rejection_reason
+# Why searching for a frontier did not produce an alternative.
+string frontier_status
