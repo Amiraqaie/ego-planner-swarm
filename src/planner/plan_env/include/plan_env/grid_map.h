@@ -311,25 +311,16 @@ private:
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_inf_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr current_floor_pub_, drone_cube_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr current_floor_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr ceiling_height_pub_;
   std::optional<double> ceiling_height_, pending_ceiling_;
-  std::optional<double> confirmed_room_height_;
-  bool ceiling_inferred_ = false;
-  struct DisplayFloorBand
-  {
-    std::optional<double> floor;
-    double ceiling;
-    double estimated_floor;
-    bool inferred_ceiling;
-  };
-  std::optional<DisplayFloorBand> previous_display_floor_;
-  int previous_floor_confirmations_ = 0;
+  Eigen::Vector2d ceiling_origin_ = Eigen::Vector2d::Zero();
   std::chrono::steady_clock::time_point last_ceiling_check_{};
   int ceiling_confirmations_ = 0;
   std::optional<double> floor_height_, pending_floor_;
+  Eigen::Vector2d floor_origin_ = Eigen::Vector2d::Zero();
   int floor_confirmations_ = 0;
-  void updateDisplayFloor();
+  void updateDisplayCeiling(bool detect_floor);
   std::optional<double> findDisplaySlab(const Eigen::Vector3d &position, bool ceiling);
 
   rclcpp::TimerBase::SharedPtr occ_timer_;
