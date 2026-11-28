@@ -1715,6 +1715,18 @@ void GridMap::publishMapInflate(bool all_info)
     return;
 
   pcl::PointCloud<pcl::PointXYZ> cloud;
+  pcl::PointXYZ pt;
+  Eigen::Vector3i min_cut = md_.local_bound_min_;
+  Eigen::Vector3i max_cut = md_.local_bound_max_;
+  if (all_info)
+  {
+    const Eigen::Vector3i margin = Eigen::Vector3i::Constant(mp_.local_map_margin_);
+    min_cut -= margin;
+    max_cut += margin;
+  }
+  boundIndex(min_cut);
+  boundIndex(max_cut);
+
   for (int x = min_cut(0); x <= max_cut(0); ++x)
     for (int y = min_cut(1); y <= max_cut(1); ++y)
       for (int z = min_cut(2); z <= max_cut(2); ++z)
